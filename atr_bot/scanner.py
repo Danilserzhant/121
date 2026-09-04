@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import time
 from dataclasses import dataclass, field
@@ -11,7 +12,7 @@ from typing import Sequence
 import aiohttp
 
 from .config import Settings
-from .exchanges import BaseExchange, ExchangeError, SymbolInfo, make_exchange
+from .exchanges import BaseExchange, Deriv, ExchangeError, SymbolInfo, make_exchange
 from .indicators import AtrMetrics, Candle, candle_returns, compute_metrics
 from .marketcap import MarketCapProvider
 
@@ -90,6 +91,9 @@ class Scanner:
         self._last: dict[str, ScanResult] = {}
         self._symbols_cache: tuple[float, list[SymbolInfo]] | None = None
         self._btc_cache: dict[str, tuple[float, dict[int, float]]] = {}  # interval -> (time, returns)
+        self._deriv_cache: tuple[float, dict[str, Deriv]] | None = None
+        # Hourly open-interest snapshots [{"t": ms, "oi": {symbol: usd}}], shared with the store for persistence.
+        self.oi_history: list[dict] = []
 
     async def __aenter__(self) -> "Scanner":
         await self.open()
@@ -154,6 +158,52 @@ class Scanner:
         self._symbols_cache = (now, symbols)
         return symbols
 
+    async def derivatives(self, force: bool = False) -> dict[str, Deriv]:
+        """Funding + open interest for all scanned symbols, cached for 10 minutes."""
+        if not force and self._deriv_cache and time.time() - self._deriv_cache[0] < 600:
+            return self._deriv_cache[1]
+        try:
+            data = await self.exchange.fetch_derivatives(await self.symbols(), self.settings.concurrency)
+        except ExchangeError as exc:
+            log.warning("derivatives fetch failed: %s", exc)
+            data = self._deriv_cache[1] if self._deriv_cache else {}
+        self._deriv_cache = (time.time(), data)
+        return data
+
+    def record_oi(self, candle_time: int, derivs: dict[str, Deriv]) -> None:
+        """Store an hourly OI snapshot (idempotent per candle)."""
+        snap = {sym: d.oi_usd for sym, d in derivs.items() if d.oi_usd}
+        if not snap:
+            return
+        for h in self.oi_history:
+            if h["t"] == candle_time:
+                h["oi"] = snap
+                break
+        else:
+            self.oi_history.append({"t": candle_time, "oi": snap})
+        self.oi_history.sort(key=lambda h: h["t"])
+        del self.oi_history[:-30]
+
+    def _oi_change(self, symbol: str, now_oi: float | None, hours: int) -> float | None:
+        if not now_oi or not self.oi_history:
+            return None
+        target = self.oi_history[-1]["t"] - hours * 3_600_000
+        # newest snapshot that is at least `hours` old
+        older = [h for h in self.oi_history if h["t"] <= target]
+        if not older:
+            return None
+        past = older[-1]["oi"].get(symbol)
+        return (now_oi / past - 1) * 100 if past else None
+
+    def _with_derivs(self, m: AtrMetrics, derivs: dict[str, Deriv]) -> AtrMetrics:
+        d = derivs.get(m.symbol)
+        if d is None:
+            return m
+        return dataclasses.replace(
+            m, funding=d.funding, oi_usd=d.oi_usd,
+            oi_change_24h=self._oi_change(m.symbol, d.oi_usd, 24), oi_change_1h=self._oi_change(m.symbol, d.oi_usd, 1),
+        )
+
     async def btc_returns(self, interval: str) -> dict[int, float]:
         """Candle returns of BTC on the interval, cached for cache_ttl seconds."""
         cached = self._btc_cache.get(interval)
@@ -189,7 +239,7 @@ class Scanner:
         started = time.time()
         symbols = await self.symbols()
         await self.mcap.get()  # warm the market cap cache (failures are logged, not fatal)
-        btc = await self.btc_returns(interval)
+        btc, derivs = await asyncio.gather(self.btc_returns(interval), self.derivatives())
         sem = asyncio.Semaphore(s.concurrency)
         limit = s.candles_needed(interval)
         lookback = s.lookback_for(interval)
@@ -209,7 +259,7 @@ class Scanner:
             )
 
         metrics = await asyncio.gather(*(one(i) for i in symbols))
-        ranked = [m for m in metrics if m is not None and m.atr_pct >= s.min_atr_pct]
+        ranked = [self._with_derivs(m, derivs) for m in metrics if m is not None and m.atr_pct >= s.min_atr_pct]
         ranked.sort(key=lambda m: m.atr_pct, reverse=True)
         result = ScanResult(
             exchange=self.exchange.name,
@@ -253,7 +303,8 @@ class Scanner:
             return compute_metrics(info.symbol, candles, self.settings.atr_period, self.settings.lookback_for(interval), info.quote_volume, cap, btc)
 
         results = await asyncio.gather(*(one(tf) for tf in intervals))
-        return dict(zip(intervals, results))
+        derivs = await self.derivatives()
+        return {tf: (self._with_derivs(m, derivs) if m else None) for tf, m in zip(intervals, results)}
 
     async def metrics_for(self, symbols: Sequence[str], interval: str) -> dict[str, AtrMetrics | None]:
         """Metrics for a list of symbols on one interval; uses the cached scan when it has them."""
@@ -284,8 +335,9 @@ class Scanner:
                         return None
                 return compute_metrics(sym, candles, self.settings.atr_period, self.settings.lookback_for(interval), info.quote_volume, await self._cap(sym), btc)
 
+            derivs = await self.derivatives()
             for sym, m in zip(missing, await asyncio.gather(*(one(s) for s in missing))):
-                out[sym] = m
+                out[sym] = self._with_derivs(m, derivs) if m else None
         return out
 
     async def candles(self, symbol: str, interval: str, limit: int) -> list[Candle] | None:

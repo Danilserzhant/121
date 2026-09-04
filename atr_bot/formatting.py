@@ -173,6 +173,23 @@ def _rho(m: AtrMetrics) -> str:
     return f"{m.btc_corr:+.2f}" if m.btc_corr is not None else "—"
 
 
+def _deriv_line(m: AtrMetrics) -> str:
+    """'фандинг +0.010% · ОИ 152M (+8% 24ч)' or '' for spot."""
+    parts = []
+    if m.funding is not None:
+        f = m.funding * 100
+        flag = " 🔻" if f <= -0.03 else (" 🔺" if f >= 0.05 else "")
+        parts.append(f"фандинг {f:+.3f}%{flag}")
+    if m.oi_usd:
+        oi = f"ОИ {fmt_big(m.oi_usd)}"
+        if m.oi_change_24h is not None:
+            oi += f" ({m.oi_change_24h:+.0f}% 24ч)"
+        elif m.oi_change_1h is not None:
+            oi += f" ({m.oi_change_1h:+.1f}% 1ч)"
+        parts.append(oi)
+    return " · ".join(parts)
+
+
 def _top_header(result: ScanResult, by: str, direction: str, min_volume: float = 0.0, min_cap: float = 0.0) -> str:
     tf = result.interval
     title = SORT_TITLES.get(by, SORT_TITLES["atr"])
@@ -195,7 +212,7 @@ def _top_footer(result: ScanResult) -> str:
     return (
         f"\n<i>ATR — средний ход за {TF_UNIT.get(tf, 'свечу')} · св — последняя свеча · "
         f"Δ — рост ATR за {_window(tf, result.lookback)} · × — объём свечи к среднему · ρ — корреляция с BTC по свечам · "
-        f"об. — оборот 24ч · 🔥 — свечей подряд в топ-20 · "
+        f"об. — оборот 24ч · ОИ — открытый интерес и его изменение · 🔺🔻 — экстремальный фандинг · 🔥 — свечей подряд в топ-20 · "
         f"обновлено {_now_utc()} UTC</i>"
     )
 
@@ -229,6 +246,7 @@ def format_top(
             + (f"  {st}" if st else "")
             + f"\n      {atr} · св {m.last_tr_pct:.1f}% · {exp} · {_vol(m.vol_ratio)} · {rho}"
             + f"\n      об. {fmt_big(m.quote_volume)}" + (f" · капа {fmt_big(m.market_cap)}" if m.market_cap else "")
+            + (f"\n      {_deriv_line(m)}" if _deriv_line(m) else "")
         )
     return head + "\n".join(lines) + _top_footer(result)
 
@@ -258,7 +276,8 @@ def format_symbol(symbol: str, per_tf: dict[str, AtrMetrics | None], ranks: dict
     head = (
         f"🔎 <b>{html.escape(symbol)}</b>{'  👀' if watched else ''}\n"
         f"Цена <code>{fmt_price(first.close)}</code> · оборот 24ч <b>{fmt_big(first.quote_volume)}</b>"
-        + (f" · капа <b>{fmt_big(first.market_cap)}</b>" if first.market_cap else "") + f"\n{LINE}\n"
+        + (f" · капа <b>{fmt_big(first.market_cap)}</b>" if first.market_cap else "")
+        + (f"\n{_deriv_line(first)}" if _deriv_line(first) else "") + f"\n{LINE}\n"
     )
     lines = []
     for tf, m in per_tf.items():
@@ -350,7 +369,9 @@ def welcome(name: str, is_admin: bool) -> str:
         "🧭 <b>ρ BTC</b> — кто ходит сам по себе, а кто вслед за биткоином\n"
         "👀 <b>Мои монеты</b> — свой список с личными алертами\n"
         "🔎 <b>Монета</b> — карточка и график. Или просто напишите тикер: <code>SOL</code>\n"
-        "🔔 <b>Подписки</b> — часовой и дневной топ, алерты «свеча-выброс»\n"
+        "🎯 <b>Совпадения</b> — кто в топе сразу на нескольких таймфреймах\n"
+        "📁 <b>Пресеты</b> — сохранённые наборы фильтров, можно на авторассылку\n"
+        "🔔 <b>Подписки</b> — часовой и дневной топ, алерты, тихие часы, дайджест\n"
     )
     if is_admin:
         text += "⚙️ <b>Настройки</b>, 👥 <b>Пользователи</b>, 📨 <b>Заявки</b> — админка\n"
@@ -370,7 +391,10 @@ HELP = (
     "/atr SOL — карточка монеты на всех таймфреймах\n"
     "/chart SOL 4h — график свечей и ATR\n"
     "/watch SOL ETH · /unwatch SOL · /watchlist — мои монеты\n"
+    "/overlap — совпадения таймфреймов\n"
+    "/presets — мои пресеты · /preset имя — сохранить текущие настройки топа\n"
     "/subs — рассылки в этот чат (или /sub, /sub 1d, /sub alerts, /unsub)\n"
+    "/quiet — тихие часы, часовой пояс, дайджест (/tz +3, /quiet 23 8, /digest 8)\n"
     "/myid — мой ID и роль · /menu — клавиатура\n"
     f"{LINE}\n"
     "<i>ATR% — средний диапазон свечи в % цены (Wilder 14). "
@@ -378,3 +402,93 @@ HELP = (
     "Δ — насколько ATR вырос к значению N свечей назад. "
     "Свеча-выброс — последняя свеча больше N старых ATR.</i>"
 )
+
+
+# ------------------------------------------------------------------ overlap / presets / quiet / digest
+
+def format_overlap(hits: list[tuple[str, dict[str, AtrMetrics]]], intervals: list[str], top_n: int) -> str:
+    """hits: [(symbol, {interval: metrics})] sorted best first."""
+    head = (
+        f"🎯 <b>Совпадения таймфреймов</b>\n"
+        f"<i>монеты в топ-{top_n} по ATR% сразу на нескольких из {', '.join(tf_name(t) for t in intervals)}</i>\n{LINE}\n"
+    )
+    if not hits:
+        return head + "Сейчас пересечений нет."
+    lines = []
+    for sym, per_tf in hits:
+        tfs = " ".join(f"<b>{tf_name(tf)}</b>" for tf in intervals if tf in per_tf)
+        first = per_tf[next(tf for tf in intervals if tf in per_tf)]
+        details = " · ".join(f"{tf_name(tf)} {m.atr_pct:.1f}%" for tf, m in per_tf.items())
+        lines.append(f"{_arrow(first.move_pct)} <b>{short_symbol(sym)}</b>  {tfs}\n      ATR: {details} · ρ {_rho(first)}")
+    return head + "\n".join(lines) + "\n\n<i>Чем больше таймфреймов совпало, тем выше монета. Обычно это самый рабочий список.</i>"
+
+
+def preset_title(p: dict) -> str:
+    bits = [tf_name(p.get("interval", "1h")), SORT_TITLES.get(p.get("by", "atr"), "").split(" ", 1)[-1][:12]]
+    if p.get("direction", "all") != "all":
+        bits.append(DIRECTION_TITLES[p["direction"]].split(" ", 1)[0])
+    if p.get("min_volume"):
+        bits.append(f"об≥{fmt_big(p['min_volume'])}")
+    if p.get("min_cap"):
+        bits.append(f"капа≥{fmt_big(p['min_cap'])}")
+    return " · ".join(b for b in bits if b)
+
+
+def format_presets(presets: list[dict]) -> str:
+    head = "📁 <b>Мои пресеты</b>\n"
+    if not presets:
+        return head + (
+            "\nПока пусто. Настройте топ кнопками (таймфрейм, фильтры, сортировка) и нажмите под ним «💾 Сохранить».\n"
+            "Пресет вызывается одной кнопкой, а с 🔔 приходит автоматически после закрытия свечи его таймфрейма."
+        )
+    lines = [f"{'🔔' if p.get('auto') else '▫️'} <b>{html.escape(p['name'])}</b> — <i>{preset_title(p)}</i>" for p in presets]
+    return head + f"<i>{len(presets)} из 10</i>\n{LINE}\n" + "\n".join(lines) + "\n\n<i>▶ запустить · 🔔 авторассылка после закрытия свечи · ✖ удалить</i>"
+
+
+def _hh(h: int) -> str:
+    return f"{h % 24:02d}:00"
+
+
+def format_prefs(p: dict, queued: int = 0) -> str:
+    tz = p["tz"]
+    quiet = f"{_hh(p['quiet_start'])}–{_hh(p['quiet_end'])}" if p["quiet_on"] else "выкл"
+    digest = _hh(p["digest_hour"]) if p["digest_on"] else "выкл"
+    text = (
+        "🌙 <b>Тихие часы и дайджест</b>\n"
+        f"{LINE}\n"
+        f"Часовой пояс: <b>UTC{tz:+d}</b>\n"
+        f"Тихие часы: <b>{quiet}</b>\n"
+        f"Утренний дайджест: <b>{digest}</b>\n"
+        f"{LINE}\n"
+        "<i>В тихие часы личные алерты не приходят, а копятся и присылаются одним сообщением, когда тихие часы закончатся. "
+        "Дайджест — раз в день: самые волатильные монеты за сутки, сколько было выбросов, что двигалось из ваших монет.</i>"
+    )
+    if queued:
+        text += f"\n\n📥 В очереди сейчас: <b>{queued}</b>"
+    return text
+
+
+def format_digest(name: str, top_text: str, queued: list[dict], breakouts_total: int, watch_lines: list[str]) -> str:
+    head = f"☀️ <b>Доброе утро, {html.escape(name)}!</b>\n<i>дайджест за последние сутки</i>\n{LINE}\n"
+    parts = []
+    if breakouts_total:
+        parts.append(f"🚨 Свечей-выбросов за сутки: <b>{breakouts_total}</b>")
+    if watch_lines:
+        parts.append("👀 <b>Ваши монеты двигались:</b>\n" + "\n".join(watch_lines[:10]))
+    if queued:
+        parts.append(f"📥 Пока вы отдыхали, пришло <b>{len(queued)}</b> алертов, они ниже.")
+    return head + ("\n\n".join(parts) + f"\n{LINE}\n" if parts else "") + top_text
+
+
+def format_queued(items: list[dict]) -> list[str]:
+    """Deferred alerts as a few messages (Telegram limit is 4096 chars)."""
+    msgs, buf = [], f"📥 <b>Пока вы отдыхали</b> · {len(items)} алертов\n{LINE}\n"
+    for it in items:
+        t = datetime.fromtimestamp(it["ts"], tz=timezone.utc).strftime("%H:%M")
+        chunk = f"\n<b>{t} UTC</b>\n{it['text']}\n"
+        if len(buf) + len(chunk) > 3800:
+            msgs.append(buf)
+            buf = ""
+        buf += chunk
+    msgs.append(buf)
+    return msgs

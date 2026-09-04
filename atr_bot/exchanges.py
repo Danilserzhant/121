@@ -47,6 +47,13 @@ class SymbolInfo:
     quote_volume: float  # 24h volume in quote asset
 
 
+@dataclass(frozen=True)
+class Deriv:
+    """Perpetual-futures extras for one symbol."""
+    funding: float | None = None   # current funding rate per period as a fraction (0.0001 = 0.01%)
+    oi_usd: float | None = None    # open interest in quote currency
+
+
 class ExchangeError(RuntimeError):
     pass
 
@@ -90,6 +97,10 @@ class BaseExchange:
 
     async def fetch_candles(self, info: SymbolInfo, interval: str, limit: int) -> list[Candle]:
         raise NotImplementedError
+
+    async def fetch_derivatives(self, symbols: list[SymbolInfo], concurrency: int = 8) -> dict[str, Deriv]:
+        """Funding rate and open interest for the given symbols. Spot exchanges return {}."""
+        return {}
 
     @staticmethod
     def _drop_open_candle(candles: list[Candle], interval: str) -> list[Candle]:
@@ -165,6 +176,25 @@ class BinanceFutures(BinanceBase):
             and s.get("contractType") == "PERPETUAL"
         )
 
+    async def fetch_derivatives(self, symbols: list[SymbolInfo], concurrency: int = 8) -> dict[str, Deriv]:
+        premium = await self._get_any_host("/fapi/v1/premiumIndex")
+        funding = {p["symbol"]: float(p.get("lastFundingRate") or 0) for p in premium}
+        prices = {p["symbol"]: float(p.get("markPrice") or 0) for p in premium}
+        sem = asyncio.Semaphore(concurrency)
+
+        async def oi(info: SymbolInfo) -> tuple[str, float | None]:
+            async with sem:
+                try:
+                    data = await self._get_any_host("/fapi/v1/openInterest", {"symbol": info.native})
+                except ExchangeError as exc:
+                    log.warning("openInterest %s: %s", info.symbol, exc)
+                    return info.symbol, None
+            contracts = float(data.get("openInterest") or 0)
+            return info.symbol, contracts * prices.get(info.symbol, 0.0)
+
+        ois = dict(await asyncio.gather(*(oi(i) for i in symbols)))
+        return {i.symbol: Deriv(funding=funding.get(i.symbol), oi_usd=ois.get(i.symbol)) for i in symbols}
+
 
 _LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 
@@ -222,6 +252,23 @@ class Bybit(BaseExchange):
             out.append(SymbolInfo(symbol=sym, native=sym, quote_volume=turnover.get(sym, 0.0)))
         return out
 
+    async def fetch_derivatives(self, symbols: list[SymbolInfo], concurrency: int = 8) -> dict[str, Deriv]:
+        tickers = await self._v5("/v5/market/tickers", {"category": "linear"})
+        by_sym = {t["symbol"]: t for t in tickers.get("list", [])}
+        out = {}
+        for i in symbols:
+            t = by_sym.get(i.native)
+            if not t:
+                continue
+            try:
+                out[i.symbol] = Deriv(
+                    funding=float(t["fundingRate"]) if t.get("fundingRate") else None,
+                    oi_usd=float(t["openInterestValue"]) if t.get("openInterestValue") else None,
+                )
+            except (TypeError, ValueError):
+                continue
+        return out
+
     async def fetch_candles(self, info: SymbolInfo, interval: str, limit: int) -> list[Candle]:
         res = await self._v5(
             "/v5/market/kline",
@@ -268,6 +315,18 @@ class Okx(BaseExchange):
             base = inst_id.split("-")[0]
             out.append(SymbolInfo(symbol=f"{base}{self.quote_asset}", native=inst_id, quote_volume=quote_vol.get(inst_id, 0.0)))
         return out
+
+    async def fetch_derivatives(self, symbols: list[SymbolInfo], concurrency: int = 8) -> dict[str, Deriv]:
+        funding_rows, oi_rows = await asyncio.gather(
+            self._v5("/api/v5/public/funding-rate", {"instId": "ANY"}),
+            self._v5("/api/v5/public/open-interest", {"instType": "SWAP"}),
+        )
+        funding = {r["instId"]: float(r["fundingRate"]) for r in funding_rows if r.get("fundingRate")}
+        oi = {r["instId"]: float(r["oiUsd"]) for r in oi_rows if r.get("oiUsd")}
+        return {
+            i.symbol: Deriv(funding=funding.get(i.native), oi_usd=oi.get(i.native))
+            for i in symbols if i.native in funding or i.native in oi
+        }
 
     async def fetch_candles(self, info: SymbolInfo, interval: str, limit: int) -> list[Candle]:
         data = await self._v5(

@@ -58,3 +58,20 @@ def test_top_history_streaks(tmp_path):
     # asking again for the same candle ignores that candle's own snapshot
     run(s.record_top("1h", 3 * h, ["A", "D"]))
     assert s.streaks("1h", 3 * h, ["A", "D"]) == {"A": 3, "D": 1}
+
+
+def test_presets_prefs_queue(tmp_path):
+    s = Store(str(tmp_path / "store.json"))
+    assert run(s.preset_save(1, {"name": "Лонг 4ч", "interval": "4h", "by": "atr"}))
+    assert run(s.preset_save(1, {"name": "лонг 4ч", "interval": "4h", "by": "expansion"}))  # replace, case-insensitive
+    assert len(s.user_presets(1)) == 1 and s.user_presets(1)[0]["by"] == "expansion"
+    assert run(s.preset_toggle_auto(1, 0)) is True
+    assert s.auto_presets("4h") == [(1, s.user_presets(1)[0])] and s.auto_presets("1h") == []
+    assert run(s.preset_delete(1, 5)) is None and run(s.preset_delete(1, 0))["name"] == "лонг 4ч"
+    assert s.user_prefs(2)["tz"] == 0
+    assert run(s.set_pref(2, tz=3, quiet_on=True))["tz"] == 3
+    run(s.enqueue(2, "watch", "hello", 1.0))
+    s2 = Store(s.path)
+    assert s2.user_prefs(2)["quiet_on"] is True
+    assert run(s2.drain_queue(2)) == [{"ts": 1.0, "kind": "watch", "text": "hello"}]
+    assert run(s2.drain_queue(2)) == []

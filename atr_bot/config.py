@@ -78,6 +78,8 @@ class Settings:
     history_top: int = field(default_factory=lambda: _env_int("HISTORY_TOP", 20))
     # Market cap cache lifetime, seconds (CoinPaprika / CoinGecko).
     mcap_ttl: int = field(default_factory=lambda: _env_int("MCAP_TTL", 1800))
+    # Overlap view: a coin must be in the top-N by ATR% on several timeframes.
+    overlap_top: int = field(default_factory=lambda: _env_int("OVERLAP_TOP", 30))
     # Chart: number of candles to draw.
     chart_candles: int = field(default_factory=lambda: _env_int("CHART_CANDLES", 120))
     # Telegram user id of the bot owner. If empty, the first person who sends

@@ -51,6 +51,10 @@ class Store:
         self.subs: dict[int, set[str]] = {}             # chat id -> subscription kinds
         self.watch: dict[int, list[str]] = {}           # user id -> symbols
         self.history: dict[str, list[dict]] = {}        # interval -> [{"t": candle_ms, "s": [symbols]}]
+        self.presets: dict[int, list[dict]] = {}        # user id -> [{"name", "by", "interval", ..., "auto"}]
+        self.prefs: dict[int, dict] = {}                # user id -> {"tz", "quiet_on", "quiet_start", "quiet_end", "digest_hour", ...}
+        self.queue: dict[int, list[dict]] = {}          # user id -> deferred alerts [{"ts", "kind", "text"}]
+        self.oi_history: list[dict] = []                # hourly OI snapshots (shared with the scanner)
         self._load()
 
     # ------------------------------------------------------------- persistence
@@ -71,6 +75,10 @@ class Store:
             self.subs.setdefault(int(chat), set()).add(SUB_1H)
         self.watch = {int(k): list(v) for k, v in data.get("watch", {}).items()}
         self.history = {k: list(v) for k, v in data.get("history", {}).items()}
+        self.presets = {int(k): list(v) for k, v in data.get("presets", {}).items()}
+        self.prefs = {int(k): dict(v) for k, v in data.get("prefs", {}).items()}
+        self.queue = {int(k): list(v) for k, v in data.get("queue", {}).items()}
+        self.oi_history[:] = list(data.get("oi_history", []))
 
     def _save(self) -> None:
         directory = os.path.dirname(self.path)
@@ -82,6 +90,10 @@ class Store:
             "subs": {str(k): sorted(v) for k, v in self.subs.items() if v},
             "watch": {str(k): v for k, v in self.watch.items() if v},
             "history": self.history,
+            "presets": {str(k): v for k, v in self.presets.items() if v},
+            "prefs": {str(k): v for k, v in self.prefs.items() if v},
+            "queue": {str(k): v for k, v in self.queue.items() if v},
+            "oi_history": self.oi_history,
         }
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -145,6 +157,9 @@ class Store:
             user = self.users.pop(user_id, None)
             self.watch.pop(user_id, None)
             self.subs.pop(user_id, None)
+            self.presets.pop(user_id, None)
+            self.prefs.pop(user_id, None)
+            self.queue.pop(user_id, None)
             if user is not None:
                 self._save()
             return user
@@ -262,3 +277,81 @@ class Store:
                     break
             out[sym] = n
         return out
+
+    # --------------------------------------------------------------- presets
+    MAX_PRESETS = 10
+
+    def user_presets(self, user_id: int) -> list[dict]:
+        return list(self.presets.get(user_id, []))
+
+    async def preset_save(self, user_id: int, preset: dict) -> bool:
+        """Add or replace (by name). Returns False when the list is full."""
+        async with self._lock:
+            lst = self.presets.setdefault(user_id, [])
+            for i, p in enumerate(lst):
+                if p["name"].lower() == preset["name"].lower():
+                    preset["auto"] = p.get("auto", False)
+                    lst[i] = preset
+                    self._save()
+                    return True
+            if len(lst) >= self.MAX_PRESETS:
+                return False
+            lst.append(preset)
+            self._save()
+            return True
+
+    async def preset_delete(self, user_id: int, index: int) -> dict | None:
+        async with self._lock:
+            lst = self.presets.get(user_id, [])
+            if not 0 <= index < len(lst):
+                return None
+            p = lst.pop(index)
+            if not lst:
+                self.presets.pop(user_id, None)
+            self._save()
+            return p
+
+    async def preset_toggle_auto(self, user_id: int, index: int) -> bool | None:
+        async with self._lock:
+            lst = self.presets.get(user_id, [])
+            if not 0 <= index < len(lst):
+                return None
+            lst[index]["auto"] = not lst[index].get("auto", False)
+            self._save()
+            return lst[index]["auto"]
+
+    def auto_presets(self, interval: str) -> list[tuple[int, dict]]:
+        return [(uid, p) for uid, lst in self.presets.items() for p in lst if p.get("auto") and p.get("interval") == interval]
+
+    # ----------------------------------------------------------------- prefs
+    DEFAULT_PREFS = {"tz": 0, "quiet_on": False, "quiet_start": 23, "quiet_end": 8, "digest_on": False, "digest_hour": 8, "last_digest": ""}
+
+    def user_prefs(self, user_id: int) -> dict:
+        return {**self.DEFAULT_PREFS, **self.prefs.get(user_id, {})}
+
+    async def set_pref(self, user_id: int, **values: object) -> dict:
+        async with self._lock:
+            p = self.prefs.setdefault(user_id, {})
+            p.update(values)
+            self._save()
+            return {**self.DEFAULT_PREFS, **p}
+
+    # ----------------------------------------------------------------- queue
+    async def enqueue(self, user_id: int, kind: str, text: str, ts: float) -> None:
+        async with self._lock:
+            q = self.queue.setdefault(user_id, [])
+            q.append({"ts": ts, "kind": kind, "text": text})
+            del q[:-100]
+            self._save()
+
+    async def drain_queue(self, user_id: int) -> list[dict]:
+        async with self._lock:
+            items = self.queue.pop(user_id, [])
+            if items:
+                self._save()
+            return items
+
+    # ----------------------------------------------------------------- misc
+    async def save(self) -> None:
+        async with self._lock:
+            self._save()

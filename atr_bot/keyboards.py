@@ -19,14 +19,16 @@ BTN_SETTINGS = "⚙️ Настройки"
 BTN_USERS = "👥 Пользователи"
 BTN_REQUESTS = "📨 Заявки"
 BTN_CANCEL = "✖ Отмена"
+BTN_OVERLAP = "🎯 Совпадения"
+BTN_PRESETS = "📁 Пресеты"
 
-MENU_BUTTONS = {BTN_TOP, BTN_EXP, BTN_WATCH, BTN_SYMBOL, BTN_SUBS, BTN_HELP, BTN_SETTINGS, BTN_USERS, BTN_REQUESTS, BTN_CANCEL}
+MENU_BUTTONS = {BTN_TOP, BTN_EXP, BTN_WATCH, BTN_SYMBOL, BTN_SUBS, BTN_HELP, BTN_SETTINGS, BTN_USERS, BTN_REQUESTS, BTN_CANCEL, BTN_OVERLAP, BTN_PRESETS}
 
 
 def main_menu(is_admin: bool) -> ReplyKeyboardMarkup:
     rows = [
-        [KeyboardButton(text=BTN_TOP), KeyboardButton(text=BTN_EXP)],
-        [KeyboardButton(text=BTN_WATCH), KeyboardButton(text=BTN_SYMBOL)],
+        [KeyboardButton(text=BTN_TOP), KeyboardButton(text=BTN_EXP), KeyboardButton(text=BTN_OVERLAP)],
+        [KeyboardButton(text=BTN_WATCH), KeyboardButton(text=BTN_SYMBOL), KeyboardButton(text=BTN_PRESETS)],
         [KeyboardButton(text=BTN_SUBS), KeyboardButton(text=BTN_HELP)],
     ]
     if is_admin:
@@ -73,7 +75,8 @@ def top_keyboard(
         InlineKeyboardButton(text=_mark(n == 10, "10"), callback_data=cb(n_=10)),
         InlineKeyboardButton(text=_mark(n == 20, "20"), callback_data=cb(n_=20)),
         InlineKeyboardButton(text=_mark(n == 30, "30"), callback_data=cb(n_=30)),
-        InlineKeyboardButton(text="📋 Таблица" if view == "list" else "📱 Список", callback_data=cb(v="table" if view == "list" else "list")),
+        InlineKeyboardButton(text="📋" if view == "list" else "📱", callback_data=cb(v="table" if view == "list" else "list")),
+        InlineKeyboardButton(text="💾", callback_data="p:save" + cb()[3:]),
         InlineKeyboardButton(text="🔄", callback_data=cb() + ":r"),
     ]
     vol_row = [InlineKeyboardButton(text="об.24ч", callback_data="noop")] + [
@@ -120,13 +123,58 @@ def watchlist_keyboard(symbols: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def subs_keyboard(store: Store, chat_id: int) -> InlineKeyboardMarkup:
+def subs_keyboard(store: Store, chat_id: int, private: bool = True) -> InlineKeyboardMarkup:
     kinds = store.chat_subs(chat_id)
     rows = [
         [InlineKeyboardButton(text=("✅ " if k in kinds else "☐ ") + SUB_TITLES[k], callback_data=f"sub:toggle:{k}")]
         for k in SUB_KINDS
     ]
+    if private:
+        rows.append([InlineKeyboardButton(text="🌙 Тихие часы и дайджест", callback_data="q:show")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def quiet_keyboard(p: dict) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="Пояс", callback_data="noop"),
+         InlineKeyboardButton(text="−1", callback_data="q:tz:-1"),
+         InlineKeyboardButton(text=f"UTC{p['tz']:+d}", callback_data="noop"),
+         InlineKeyboardButton(text="+1", callback_data="q:tz:1")],
+        [InlineKeyboardButton(text=("✅ Тихие часы" if p["quiet_on"] else "☐ Тихие часы"), callback_data="q:quiet")],
+        [InlineKeyboardButton(text="с", callback_data="noop"),
+         InlineKeyboardButton(text="−", callback_data="q:qs:-1"),
+         InlineKeyboardButton(text=f"{p['quiet_start'] % 24:02d}:00", callback_data="noop"),
+         InlineKeyboardButton(text="+", callback_data="q:qs:1"),
+         InlineKeyboardButton(text="до", callback_data="noop"),
+         InlineKeyboardButton(text="−", callback_data="q:qe:-1"),
+         InlineKeyboardButton(text=f"{p['quiet_end'] % 24:02d}:00", callback_data="noop"),
+         InlineKeyboardButton(text="+", callback_data="q:qe:1")],
+        [InlineKeyboardButton(text=("✅ Дайджест" if p["digest_on"] else "☐ Дайджест"), callback_data="q:digest"),
+         InlineKeyboardButton(text="−", callback_data="q:dh:-1"),
+         InlineKeyboardButton(text=f"{p['digest_hour'] % 24:02d}:00", callback_data="noop"),
+         InlineKeyboardButton(text="+", callback_data="q:dh:1")],
+        [InlineKeyboardButton(text="☀️ Прислать дайджест сейчас", callback_data="q:now"),
+         InlineKeyboardButton(text="◀ Подписки", callback_data="q:back")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def presets_keyboard(presets: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for i, p in enumerate(presets):
+        rows.append([
+            InlineKeyboardButton(text=f"▶ {p['name'][:18]}", callback_data=f"p:run:{i}"),
+            InlineKeyboardButton(text="🔔" if p.get("auto") else "🔕", callback_data=f"p:auto:{i}"),
+            InlineKeyboardButton(text="✖", callback_data=f"p:del:{i}"),
+        ])
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="p:list")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def overlap_keyboard(symbols: list[str]) -> InlineKeyboardMarkup:
+    m = symbols_keyboard(symbols[:9])
+    m.inline_keyboard.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="ov:refresh")])
+    return m
 
 
 # Settings menu: attribute -> (label, choices)

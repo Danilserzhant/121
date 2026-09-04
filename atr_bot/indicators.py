@@ -78,6 +78,10 @@ class AtrMetrics:
     market_cap: float = 0.0  # USD, 0 = unknown
     btc_corr: float | None = None  # Pearson correlation of candle returns with BTC (None = not enough data)
     corr_points: int = 0           # how many candles the correlation was computed on
+    funding: float | None = None   # current funding rate (fraction per period), perpetuals only
+    oi_usd: float | None = None    # open interest in quote currency
+    oi_change_24h: float | None = None  # % change of open interest vs ~24h ago (needs collected history)
+    oi_change_1h: float | None = None   # % change vs the previous hourly snapshot
 
     @property
     def direction(self) -> str:

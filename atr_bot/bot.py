@@ -69,6 +69,8 @@ class Deps:
         self.store = store
         # (user_id, symbol, kind) -> candle_time of the last alert, to avoid repeats
         self.alerted: dict[tuple[int, str, str], int] = {}
+        # (unix ts, number of breakout coins) per hourly scan, for the daily digest
+        self.breakout_log: list[tuple[float, int]] = []
 
 
 class Ask(StatesGroup):
@@ -219,6 +221,8 @@ async def btn_cancel(message: Message, deps: Deps, state: FSMContext) -> None:
 class TopQuery:
     """Everything that defines one top view."""
 
+    FIELDS = ("by", "interval", "n", "direction", "view", "min_volume", "min_cap")
+
     def __init__(self, settings: Settings, by: str = "atr"):
         self.by = by
         self.interval = settings.interval
@@ -227,6 +231,32 @@ class TopQuery:
         self.view = "list"
         self.min_volume = 0.0
         self.min_cap = 0.0
+
+    def to_dict(self) -> dict:
+        return {f: getattr(self, f) for f in self.FIELDS}
+
+    @classmethod
+    def from_dict(cls, settings: Settings, d: dict) -> "TopQuery":
+        q = cls(settings, d.get("by", "atr"))
+        for f in cls.FIELDS:
+            if f in d:
+                setattr(q, f, d[f])
+        return q
+
+    @classmethod
+    def from_callback(cls, settings: Settings, parts: list[str]) -> "TopQuery | None":
+        """parts = [by, interval, n, direction, view, vol_millions, cap_millions]."""
+        if len(parts) < 7:
+            return None
+        by, interval, n_s, direction, view, vol_s, cap_s = parts[:7]
+        if (interval not in settings.intervals or by not in SORTS or direction not in DIRECTION_TITLES
+                or view not in VIEWS or not vol_s.isdigit() or not cap_s.isdigit()):
+            return None
+        q = cls(settings, by)
+        q.interval, q.direction, q.view = interval, direction, view
+        q.n = max(1, min(50, int(n_s))) if n_s.isdigit() else settings.top_n
+        q.min_volume, q.min_cap = int(vol_s) * 1e6, int(cap_s) * 1e6
+        return q
 
 
 def _parse_top_args(args: str | None, settings: Settings, by: str) -> TopQuery | None:
@@ -338,19 +368,11 @@ async def btn_exp(message: Message, deps: Deps, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("top:"))
 async def cb_top(query: CallbackQuery, deps: Deps) -> None:
     parts = query.data.split(":")
-    if len(parts) < 8:
+    q = TopQuery.from_callback(deps.settings, parts[1:8])
+    if q is None:
         await query.answer()
         return
-    _, by, interval, n_s, direction, view, vol_s, cap_s = parts[:8]
     refresh = len(parts) > 8 and parts[8] == "r"
-    if (interval not in deps.settings.intervals or by not in SORTS or direction not in DIRECTION_TITLES
-            or view not in VIEWS or not vol_s.isdigit() or not cap_s.isdigit()):
-        await query.answer()
-        return
-    q = TopQuery(deps.settings, by)
-    q.interval, q.direction, q.view = interval, direction, view
-    q.n = max(1, min(50, int(n_s))) if n_s.isdigit() else deps.settings.top_n
-    q.min_volume, q.min_cap = int(vol_s) * 1e6, int(cap_s) * 1e6
     await query.answer("Обновляю…" if refresh else None)
     await show_top(query.message, deps, q, edit=True, force=refresh)
 
@@ -643,7 +665,7 @@ async def cmd_sub(message: Message, command: CommandObject, deps: Deps) -> None:
         return
     added = await deps.store.subscribe(message.chat.id, kind)
     prefix = "✅ Подписал: " if added else "Уже подписаны: "
-    await message.answer(prefix + SUB_TITLES[kind] + ".\n\n" + _subs_text(deps.store, message.chat.id), reply_markup=kb.subs_keyboard(deps.store, message.chat.id))
+    await message.answer(prefix + SUB_TITLES[kind] + ".\n\n" + _subs_text(deps.store, message.chat.id), reply_markup=kb.subs_keyboard(deps.store, message.chat.id, message.chat.type == "private"))
 
 
 @router.message(Command("unsub"))
@@ -655,14 +677,14 @@ async def cmd_unsub(message: Message, command: CommandObject, deps: Deps) -> Non
         return
     removed = await deps.store.unsubscribe(message.chat.id, kind)
     prefix = ("🔕 Отключил: " + ", ".join(SUB_TITLES[k] for k in SUB_KINDS if k in removed) + ".\n\n") if removed else "Такой подписки не было.\n\n"
-    await message.answer(prefix + _subs_text(deps.store, message.chat.id), reply_markup=kb.subs_keyboard(deps.store, message.chat.id))
+    await message.answer(prefix + _subs_text(deps.store, message.chat.id), reply_markup=kb.subs_keyboard(deps.store, message.chat.id, message.chat.type == "private"))
 
 
 @router.message(Command("subs"))
 @router.message(F.text == kb.BTN_SUBS)
 async def cmd_subs(message: Message, deps: Deps, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(_subs_text(deps.store, message.chat.id), reply_markup=kb.subs_keyboard(deps.store, message.chat.id))
+    await message.answer(_subs_text(deps.store, message.chat.id), reply_markup=kb.subs_keyboard(deps.store, message.chat.id, message.chat.type == "private"))
 
 
 @router.callback_query(F.data.startswith("sub:toggle:"))
@@ -678,7 +700,7 @@ async def cb_sub_toggle(query: CallbackQuery, deps: Deps) -> None:
     else:
         await deps.store.subscribe(chat_id, kind)
         await query.answer(f"✅ {SUB_TITLES[kind]}: вкл")
-    await _safe_edit(query.message, _subs_text(deps.store, chat_id), kb.subs_keyboard(deps.store, chat_id))
+    await _safe_edit(query.message, _subs_text(deps.store, chat_id), kb.subs_keyboard(deps.store, chat_id, query.message.chat.type == "private"))
 
 
 # ------------------------------------------------------------------ admin
@@ -955,18 +977,23 @@ async def _broadcast(bot: Bot, deps: Deps, chats: list[int], text: str, **kwargs
 
 
 async def _breakout_alerts(bot: Bot, deps: Deps, result: ScanResult) -> None:
-    chats = deps.store.subscribed(SUB_ALERTS)
-    if not chats:
-        return
+    from .extras import send_alert
+
     s = deps.settings
     hits = [m for m in result.ranked if m.last_tr_ratio >= s.alert_tr_ratio and m.last_tr_pct >= s.alert_min_tr_pct]
-    if not hits:
+    now = time.time()
+    deps.breakout_log = [(t, n) for t, n in deps.breakout_log if now - t < 86_400] + [(now, len(hits))]
+    chats = deps.store.subscribed(SUB_ALERTS)
+    if not hits or not chats:
         return
     hits.sort(key=lambda m: m.last_tr_ratio, reverse=True)
-    await _broadcast(
-        bot, deps, chats, format_breakouts(hits[:15], result.interval, s.alert_tr_ratio),
-        reply_markup=kb.symbols_keyboard([m.symbol for m in hits[:6]]),
-    )
+    text = format_breakouts(hits[:15], result.interval, s.alert_tr_ratio)
+    markup = kb.symbols_keyboard([m.symbol for m in hits[:6]])
+    groups = [c for c in chats if c < 0]
+    if groups:
+        await _broadcast(bot, deps, groups, text, reply_markup=markup)
+    for uid in (c for c in chats if c > 0):
+        await send_alert(bot, deps, uid, "breakout", text, markup)
 
 
 async def _watch_alerts(bot: Bot, deps: Deps, interval: str) -> None:
@@ -990,7 +1017,9 @@ async def _watch_alerts(bot: Bot, deps: Deps, interval: str) -> None:
                 reasons.append(f"ATR вырос на {m.expansion_pct:+.0f}% за {s.lookback_for(interval)} свечей (порог {s.watch_expansion_pct:g}%)")
                 deps.alerted[key_exp] = m.candle_time
             if reasons:
-                await _notify(bot, uid, format_watch_alert(m, interval, reasons), kb.symbol_keyboard(s, sym, True))
+                from .extras import send_alert
+
+                await send_alert(bot, deps, uid, "watch", format_watch_alert(m, interval, reasons), kb.symbol_keyboard(s, sym, True))
                 await asyncio.sleep(0.05)
 
 
@@ -1007,11 +1036,22 @@ async def _after_close(bot: Bot, deps: Deps, interval: str, sub_kind: str) -> No
         q.interval = interval
         await _broadcast(bot, deps, chats, _top_text(deps, result, q), reply_markup=_top_kb(deps, q))
     if interval == "1h":
+        try:
+            deps.scanner.record_oi(result.candle_time, await deps.scanner.derivatives(force=True))
+            await deps.store.save()
+        except Exception:  # noqa: BLE001
+            log.exception("OI snapshot failed")
         await _breakout_alerts(bot, deps, result)
     try:
         await _watch_alerts(bot, deps, interval)
     except ExchangeError:
         log.exception("watch alerts on %s failed", interval)
+    from .extras import send_alert
+
+    for uid, p in deps.store.auto_presets(interval):
+        q = TopQuery.from_dict(deps.settings, p)
+        text = f"📁 <b>{html.escape(p['name'])}</b>\n" + _top_text(deps, result, q)
+        await send_alert(bot, deps, uid, "preset", text, _top_kb(deps, q))
 
 
 async def candle_scheduler(bot: Bot, deps: Deps, interval: str, sub_kind: str) -> None:
@@ -1037,7 +1077,10 @@ USER_COMMANDS = [
     BotCommand(command="watch", description="Следить за монетой: /watch SOL"),
     BotCommand(command="watchlist", description="Мои монеты"),
     BotCommand(command="unwatch", description="Перестать следить: /unwatch SOL"),
+    BotCommand(command="overlap", description="Совпадения таймфреймов"),
+    BotCommand(command="presets", description="Мои пресеты"),
     BotCommand(command="subs", description="Рассылки в этот чат"),
+    BotCommand(command="quiet", description="Тихие часы, пояс, дайджест"),
     BotCommand(command="myid", description="Мой Telegram ID и роль"),
     BotCommand(command="help", description="Справка"),
 ]
@@ -1060,15 +1103,20 @@ async def run_bot(settings: Settings) -> None:
         if store.is_admin(uid):
             await _set_menu(bot, uid, ADMIN_COMMANDS)
     async with Scanner(settings) as scanner:
+        from .extras import prefs_scheduler, router as extras_router
+
+        scanner.oi_history = store.oi_history  # shared list: the store persists it
         deps = Deps(settings, scanner, store)
         dp = Dispatcher()
         dp.message.outer_middleware(AccessMiddleware(deps))
         dp.callback_query.outer_middleware(AccessMiddleware(deps))
+        dp.include_router(extras_router)  # before the main router: its catch-all text handler must come last
         dp.include_router(router)
         dp["deps"] = deps
         tasks = [
             asyncio.create_task(candle_scheduler(bot, deps, "1h", SUB_1H)),
             asyncio.create_task(candle_scheduler(bot, deps, "1d", SUB_1D)),
+            asyncio.create_task(prefs_scheduler(bot, deps)),
         ]
         try:
             log.info("bot started on %s, %d users", settings.exchange, len(store.users))
