@@ -20,6 +20,20 @@ def _env_float(name: str, default: float) -> float:
     return float(raw) if raw not in (None, "") else default
 
 
+def _env_lookbacks(name: str, default: dict[str, int]) -> dict[str, int]:
+    """Parse '1h:24,4h:6,1d:7,1w:4' into a dict, falling back to defaults."""
+    out = dict(default)
+    raw = os.getenv(name, "")
+    for part in raw.replace(";", ",").split(","):
+        if ":" in part:
+            tf, n = part.split(":", 1)
+            try:
+                out[tf.strip()] = int(n)
+            except ValueError:
+                continue
+    return out
+
+
 def _env_list_int(name: str) -> list[int]:
     raw = os.getenv(name, "")
     return [int(x) for x in raw.replace(";", ",").split(",") if x.strip()]
@@ -31,13 +45,16 @@ class Settings:
     # Exchange: binance_futures | binance_spot | bybit | okx
     exchange: str = field(default_factory=lambda: os.getenv("EXCHANGE", "binance_futures"))
     quote_asset: str = field(default_factory=lambda: os.getenv("QUOTE_ASSET", "USDT"))
-    # Candle interval (only 1h is officially supported by the ranking logic,
-    # but any interval the exchange knows will work).
+    # Default candle interval for /top and the auto push.
     interval: str = field(default_factory=lambda: os.getenv("INTERVAL", "1h"))
+    # Timeframes users can ask for.
+    intervals: tuple[str, ...] = ("1h", "4h", "1d", "1w")
     # ATR period in candles.
     atr_period: int = field(default_factory=lambda: _env_int("ATR_PERIOD", 14))
-    # How many candles back to compare the current ATR against ("expansion").
-    lookback: int = field(default_factory=lambda: _env_int("EXPANSION_LOOKBACK", 24))
+    # How many candles back to compare the current ATR against ("expansion"), per timeframe.
+    lookbacks: dict[str, int] = field(
+        default_factory=lambda: _env_lookbacks("EXPANSION_LOOKBACK", {"1h": 24, "4h": 6, "1d": 7, "1w": 4})
+    )
     # How many coins to show by default.
     top_n: int = field(default_factory=lambda: _env_int("TOP_N", 15))
     # Filter out illiquid coins: minimum 24h quote volume (in quote asset).
@@ -60,9 +77,14 @@ class Settings:
     # Optional HTTP(S) proxy for the exchange API (useful where Binance is geo-blocked).
     exchange_proxy: str = field(default_factory=lambda: os.getenv("EXCHANGE_PROXY", ""))
 
-    def candles_needed(self) -> int:
-        # Need enough history for a stable Wilder ATR before the lookback window.
-        return self.atr_period * 3 + self.lookback + 2
+    def lookback_for(self, interval: str) -> int:
+        return self.lookbacks.get(interval, self.lookbacks.get(self.interval, 24))
+
+    def candles_needed(self, interval: str) -> int:
+        # Enough history for a stable Wilder ATR before the lookback window.
+        # Exchanges return fewer candles for young coins; the metric still works
+        # with atr_period + lookback + 1 candles.
+        return self.atr_period * 3 + self.lookback_for(interval) + 2
 
 
 settings = Settings()

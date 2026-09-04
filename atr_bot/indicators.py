@@ -30,6 +30,21 @@ def true_ranges(candles: Sequence[Candle]) -> list[float]:
     return out
 
 
+def true_ranges_pct(candles: Sequence[Candle]) -> list[float]:
+    """True range of every candle as % of the previous close (first: of its own open).
+
+    Averaging percentages instead of price units keeps ATR% meaningful when the
+    price level changes a lot inside the window (pumps, crashes, new listings).
+    """
+    out: list[float] = []
+    prev_close: float | None = None
+    for c, tr in zip(candles, true_ranges(candles)):
+        base = prev_close if prev_close else c.open
+        out.append(tr / base * 100 if base > 0 else 0.0)
+        prev_close = c.close
+    return out
+
+
 def wilder_atr(trs: Sequence[float], period: int) -> list[float | None]:
     """Wilder's smoothed ATR. Returns None for indexes before the first full period."""
     if period <= 0:
@@ -49,13 +64,13 @@ def wilder_atr(trs: Sequence[float], period: int) -> list[float | None]:
 class AtrMetrics:
     symbol: str
     close: float
-    atr: float            # current ATR in price units
-    atr_pct: float        # ATR as % of price  ("clean" average hourly move)
-    atr_prev: float       # ATR `lookback` candles ago
-    atr_prev_pct: float
-    expansion_pct: float  # (atr / atr_prev - 1) * 100
+    atr: float            # current ATR in price units (Wilder on raw true ranges)
+    atr_pct: float        # ATR of per-candle true ranges in % of price ("clean" average move)
+    atr_prev: float       # ATR (price units) `lookback` candles ago
+    atr_prev_pct: float   # ATR% `lookback` candles ago
+    expansion_pct: float  # (atr_pct / atr_prev_pct - 1) * 100
     last_tr_pct: float    # true range of the last closed candle in % of price
-    last_tr_ratio: float  # last_tr / atr_prev  (how many "old" ATRs the last bar moved)
+    last_tr_ratio: float  # last_tr_pct / atr_prev_pct (how many "old" ATRs the last bar moved)
     move_pct: float       # net close-to-close move over the lookback window, %
     quote_volume: float   # 24h quote volume
     candle_time: int      # open time (ms) of the last candle used
@@ -76,12 +91,14 @@ def compute_metrics(
     if len(candles) < period + lookback + 1:
         return None
     trs = true_ranges(candles)
+    trs_pct = true_ranges_pct(candles)
     atrs = wilder_atr(trs, period)
+    atrs_pct = wilder_atr(trs_pct, period)
     now_i = len(candles) - 1
     prev_i = now_i - lookback
-    atr_now = atrs[now_i]
-    atr_prev = atrs[prev_i]
-    if atr_now is None or atr_prev is None or atr_prev <= 0:
+    atr_now, atr_prev = atrs[now_i], atrs[prev_i]
+    atr_now_pct, atr_prev_pct = atrs_pct[now_i], atrs_pct[prev_i]
+    if None in (atr_now, atr_prev, atr_now_pct, atr_prev_pct) or atr_prev_pct <= 0:
         return None
     last = candles[now_i]
     prev_close = candles[prev_i].close
@@ -91,12 +108,12 @@ def compute_metrics(
         symbol=symbol,
         close=last.close,
         atr=atr_now,
-        atr_pct=atr_now / last.close * 100,
+        atr_pct=atr_now_pct,
         atr_prev=atr_prev,
-        atr_prev_pct=atr_prev / prev_close * 100,
-        expansion_pct=(atr_now / atr_prev - 1) * 100,
-        last_tr_pct=trs[now_i] / last.close * 100,
-        last_tr_ratio=trs[now_i] / atr_prev,
+        atr_prev_pct=atr_prev_pct,
+        expansion_pct=(atr_now_pct / atr_prev_pct - 1) * 100,
+        last_tr_pct=trs_pct[now_i],
+        last_tr_ratio=trs_pct[now_i] / atr_prev_pct,
         move_pct=(last.close / prev_close - 1) * 100,
         quote_volume=quote_volume,
         candle_time=last.open_time,

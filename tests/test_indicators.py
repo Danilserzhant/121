@@ -1,4 +1,4 @@
-from atr_bot.indicators import Candle, compute_metrics, true_ranges, wilder_atr
+from atr_bot.indicators import Candle, compute_metrics, true_ranges, true_ranges_pct, wilder_atr
 
 
 def mk(i, o, h, l, c):
@@ -31,7 +31,19 @@ def test_compute_metrics_expansion():
     assert m.expansion_pct > 100  # ATR more than doubled
     assert m.atr_pct > m.atr_prev_pct
     assert abs(m.move_pct - (110 / 100 - 1) * 100) < 1e-9
-    assert abs(m.last_tr_pct - 25 / 110 * 100) < 1e-9
+    assert abs(m.last_tr_pct - 25 / 105 * 100) < 1e-9  # % of previous close
+
+
+def test_atr_pct_is_scale_invariant():
+    """A crash from 100 to 1 must not inflate ATR% via stale high-priced candles."""
+    period, lookback = 3, 2
+    calm_high = [mk(i, 100, 101, 99, 100) for i in range(4)]
+    crash = [mk(4, 100, 100, 1, 1)]
+    calm_low = [mk(5 + i, 1, 1.01, 0.99, 1) for i in range(6)]
+    m = compute_metrics("X", calm_high + crash + calm_low, period, lookback)
+    assert m is not None
+    assert m.atr_pct < 40  # Wilder memory of the crash candle decays, price-unit ATR would give ~2000%
+    assert true_ranges_pct(calm_low[:2])[1] == (1.01 - 0.99) / 1 * 100
 
 
 def test_compute_metrics_needs_history():

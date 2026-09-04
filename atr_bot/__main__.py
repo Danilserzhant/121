@@ -30,15 +30,17 @@ async def _scan_cli(args: argparse.Namespace) -> None:
     if args.period:
         settings.atr_period = args.period
     if args.lookback:
-        settings.lookback = args.lookback
+        settings.lookbacks[args.interval or settings.interval] = args.lookback
+    if args.interval:
+        settings.interval = args.interval
     if args.volume is not None:
         settings.min_quote_volume = args.volume
     async with Scanner(settings) as scanner:
         if args.symbol:
-            m = await scanner.symbol_metrics(args.symbol)
-            print(_strip_html(format_symbol(m, None, settings.interval)) if m else "symbol not found")
+            per_tf = await scanner.symbol_metrics(args.symbol)
+            print(_strip_html(format_symbol(scanner.normalize_symbol(args.symbol), per_tf, {})) if per_tf else "symbol not found")
             return
-        result = await scanner.scan(force=True)
+        result = await scanner.scan(settings.interval, force=True)
         print(_strip_html(format_top(result, args.top or settings.top_n)))
         print(f"\n{len(result.ranked)} coins ranked, {result.errors} errors, {result.duration:.1f}s")
 
@@ -49,6 +51,7 @@ def main(argv: list[str] | None = None) -> None:
     scan = sub.add_parser("scan", help="run one scan and print it")
     scan.add_argument("--top", type=int, default=None)
     scan.add_argument("--exchange", default=None, help="binance_futures | binance_spot | bybit | okx")
+    scan.add_argument("--interval", "-i", default=None, help="1h | 4h | 1d | 1w")
     scan.add_argument("--period", type=int, default=None)
     scan.add_argument("--lookback", type=int, default=None)
     scan.add_argument("--volume", type=float, default=None, help="min 24h quote volume")

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from typing import Sequence
 
 import aiohttp
 
@@ -60,8 +61,8 @@ class Scanner:
         self.settings = settings
         self._session: aiohttp.ClientSession | None = None
         self._exchange: BaseExchange | None = None
-        self._lock = asyncio.Lock()
-        self._last: ScanResult | None = None
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._last: dict[str, ScanResult] = {}
         self._symbols_cache: tuple[float, list[SymbolInfo]] | None = None
 
     async def __aenter__(self) -> "Scanner":
@@ -90,13 +91,12 @@ class Scanner:
             raise RuntimeError("Scanner is not opened")
         return self._exchange
 
-    @property
-    def last(self) -> ScanResult | None:
-        return self._last
+    def last(self, interval: str | None = None) -> ScanResult | None:
+        return self._last.get(interval or self.settings.interval)
 
     def invalidate(self) -> None:
         """Drop cached results (after settings change)."""
-        self._last = None
+        self._last = {}
         self._symbols_cache = None
 
     async def symbols(self) -> list[SymbolInfo]:
@@ -116,63 +116,76 @@ class Scanner:
         self._symbols_cache = (now, symbols)
         return symbols
 
-    async def scan(self, force: bool = False) -> ScanResult:
-        """Run a full scan, or return the cached result if it is fresh enough."""
-        async with self._lock:
-            if (
-                not force
-                and self._last is not None
-                and time.time() - self._last.scanned_at < self.settings.cache_ttl
-            ):
-                return self._last
-            result = await self._scan()
-            self._last = result
+    async def scan(self, interval: str | None = None, force: bool = False) -> ScanResult:
+        """Run a full scan for the interval, or return a fresh-enough cached result."""
+        interval = interval or self.settings.interval
+        lock = self._locks.setdefault(interval, asyncio.Lock())
+        async with lock:
+            cached = self._last.get(interval)
+            if not force and cached is not None and time.time() - cached.scanned_at < self.settings.cache_ttl:
+                return cached
+            result = await self._scan(interval)
+            self._last[interval] = result
             return result
 
-    async def _scan(self) -> ScanResult:
+    async def _scan(self, interval: str) -> ScanResult:
         s = self.settings
         started = time.time()
         symbols = await self.symbols()
         sem = asyncio.Semaphore(s.concurrency)
-        limit = s.candles_needed()
+        limit = s.candles_needed(interval)
+        lookback = s.lookback_for(interval)
         errors = 0
 
         async def one(info: SymbolInfo) -> AtrMetrics | None:
             nonlocal errors
             async with sem:
                 try:
-                    candles = await self.exchange.fetch_candles(info, s.interval, limit)
+                    candles = await self.exchange.fetch_candles(info, interval, limit)
                 except ExchangeError as exc:
                     errors += 1
                     log.warning("%s: %s", info.symbol, exc)
                     return None
-            return compute_metrics(info.symbol, candles, s.atr_period, s.lookback, info.quote_volume)
+            return compute_metrics(info.symbol, candles, s.atr_period, lookback, info.quote_volume)
 
         metrics = await asyncio.gather(*(one(i) for i in symbols))
         ranked = [m for m in metrics if m is not None and m.atr_pct >= s.min_atr_pct]
         ranked.sort(key=lambda m: m.atr_pct, reverse=True)
         result = ScanResult(
             exchange=self.exchange.name,
-            interval=s.interval,
+            interval=interval,
             atr_period=s.atr_period,
-            lookback=s.lookback,
+            lookback=lookback,
             scanned_at=time.time(),
             total_symbols=len(symbols),
             ranked=ranked,
             errors=errors,
             duration=time.time() - started,
         )
-        log.info("scan done: %d ranked / %d symbols, %d errors, %.1fs", len(ranked), len(symbols), errors, result.duration)
+        log.info("scan %s done: %d ranked / %d symbols, %d errors, %.1fs", interval, len(ranked), len(symbols), errors, result.duration)
         return result
 
-    async def symbol_metrics(self, symbol: str) -> AtrMetrics | None:
-        """Fresh metrics for one symbol (bypasses volume filter)."""
+    def normalize_symbol(self, symbol: str) -> str:
         symbol = symbol.upper().replace("-", "").replace("/", "")
         if not symbol.endswith(self.settings.quote_asset):
             symbol += self.settings.quote_asset
+        return symbol
+
+    async def symbol_metrics(self, symbol: str, intervals: Sequence[str] | None = None) -> dict[str, AtrMetrics | None] | None:
+        """Fresh metrics for one symbol on every interval (bypasses volume filter).
+
+        Returns None if the symbol is unknown, otherwise {interval: metrics or None}.
+        """
+        symbol = self.normalize_symbol(symbol)
+        intervals = list(intervals or self.settings.intervals)
         all_symbols = await self.exchange.list_symbols()
         info = next((i for i in all_symbols if i.symbol == symbol), None)
         if info is None:
             return None
-        candles = await self.exchange.fetch_candles(info, self.settings.interval, self.settings.candles_needed())
-        return compute_metrics(info.symbol, candles, self.settings.atr_period, self.settings.lookback, info.quote_volume)
+
+        async def one(interval: str) -> AtrMetrics | None:
+            candles = await self.exchange.fetch_candles(info, interval, self.settings.candles_needed(interval))
+            return compute_metrics(info.symbol, candles, self.settings.atr_period, self.settings.lookback_for(interval), info.quote_volume)
+
+        results = await asyncio.gather(*(one(tf) for tf in intervals))
+        return dict(zip(intervals, results))

@@ -29,6 +29,7 @@ _INTERVAL_MS = {
     "6h": 21_600_000,
     "12h": 43_200_000,
     "1d": 86_400_000,
+    "1w": 604_800_000,
 }
 
 
@@ -191,7 +192,7 @@ class BinanceSpot(BinanceBase):
 class Bybit(BaseExchange):
     name = "bybit"
     host = "https://api.bybit.com"
-    _intervals = {"1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720", "1d": "D"}
+    _intervals = {"1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720", "1d": "D", "1w": "W"}
 
     async def _v5(self, path: str, params: dict[str, Any]) -> Any:
         data = await self._get(self.host + path, params)
@@ -239,7 +240,7 @@ class Bybit(BaseExchange):
 class Okx(BaseExchange):
     name = "okx"
     host = "https://www.okx.com"
-    _bars = {"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H", "2h": "2H", "4h": "4H", "6h": "6H", "12h": "12H", "1d": "1D"}
+    _bars = {"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H", "2h": "2H", "4h": "4H", "6h": "6Hutc", "12h": "12Hutc", "1d": "1Dutc", "1w": "1Wutc"}
 
     async def _v5(self, path: str, params: dict[str, Any]) -> Any:
         data = await self._get(self.host + path, params)

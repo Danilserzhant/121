@@ -17,7 +17,7 @@ from aiogram.types import BotCommand, BotCommandScopeChat, Message, TelegramObje
 
 from .config import Settings
 from .exchanges import ExchangeError, interval_ms
-from .formatting import HELP, format_settings, format_symbol, format_top
+from .formatting import HELP, format_settings, format_symbol, format_top, parse_timeframe, tf_name
 from .scanner import Scanner
 from .storage import ROLE_ADMIN, ROLE_OWNER, ROLE_TRADER, ROLE_TITLES, Store, User
 
@@ -32,8 +32,8 @@ PUBLIC_COMMANDS = {"start", "myid", "help"}
 _SET_PARAMS: dict[str, tuple[str, type, tuple[float, float]]] = {
     "period": ("atr_period", int, (2, 200)),
     "период": ("atr_period", int, (2, 200)),
-    "lookback": ("lookback", int, (1, 500)),
-    "окно": ("lookback", int, (1, 500)),
+    "lookback": ("lookbacks", int, (1, 500)),  # handled specially (per timeframe)
+    "окно": ("lookbacks", int, (1, 500)),
     "top": ("top_n", int, (1, 50)),
     "топ": ("top_n", int, (1, 50)),
     "volume": ("min_quote_volume", float, (0, 1e12)),
@@ -147,17 +147,33 @@ async def cmd_myid(message: Message, deps: Deps) -> None:
 
 # ------------------------------------------------------------------ traders
 
+def _parse_top_args(args: str | None, settings: Settings) -> tuple[str, int] | None:
+    """'/top 4h 20', '/top 20 4h', '/top d' -> (interval, n). None on bad input."""
+    interval, n = settings.interval, settings.top_n
+    for token in (args or "").split():
+        tf = parse_timeframe(token)
+        if tf is not None and tf in settings.intervals:
+            interval = tf
+        elif token.isdigit():
+            n = max(1, min(50, int(token)))
+        else:
+            return None
+    return interval, n
+
+
 async def _send_top(message: Message, command: CommandObject, deps: Deps, by: str) -> None:
-    n = deps.settings.top_n
-    if command.args:
-        try:
-            n = max(1, min(50, int(command.args.strip())))
-        except ValueError:
-            await message.answer(f"Использование: <code>/{command.command} 20</code>")
-            return
-    status = await message.answer("⏳ Сканирую рынок…")
+    parsed = _parse_top_args(command.args, deps.settings)
+    if parsed is None:
+        tfs = ", ".join(deps.settings.intervals)
+        await message.answer(
+            f"Использование: <code>/{command.command} [таймфрейм] [N]</code>\n"
+            f"Например <code>/{command.command} 4h 20</code>. Таймфреймы: {tfs}"
+        )
+        return
+    interval, n = parsed
+    status = await message.answer(f"⏳ Сканирую рынок · {tf_name(interval)}…")
     try:
-        result = await deps.scanner.scan()
+        result = await deps.scanner.scan(interval)
     except ExchangeError as exc:
         log.exception("scan failed")
         await status.edit_text(f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
@@ -181,15 +197,23 @@ async def cmd_atr(message: Message, command: CommandObject, deps: Deps) -> None:
         await message.answer("Использование: <code>/atr BTC</code> или <code>/atr BTCUSDT</code>")
         return
     symbol = command.args.split()[0]
+    status = await message.answer("⏳ Считаю…")
     try:
-        m = await deps.scanner.symbol_metrics(symbol)
+        per_tf = await deps.scanner.symbol_metrics(symbol)
     except ExchangeError as exc:
-        await message.answer(f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
+        await status.edit_text(f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
         return
-    if m is None:
-        await message.answer(f"Не нашёл монету <code>{html.escape(symbol.upper())}</code> на {deps.settings.exchange} или мало истории.")
+    if per_tf is None:
+        await status.edit_text(f"Не нашёл монету <code>{html.escape(symbol.upper())}</code> на {deps.settings.exchange}.")
         return
-    await message.answer(format_symbol(m, deps.scanner.last, deps.settings.interval))
+    name = deps.scanner.normalize_symbol(symbol)
+    ranks: dict[str, tuple[int, int]] = {}
+    for tf in per_tf:
+        last = deps.scanner.last(tf)
+        rank = last.rank_of(name) if last else None
+        if last and rank:
+            ranks[tf] = (rank, len(last.ranked))
+    await status.edit_text(format_symbol(name, per_tf, ranks))
 
 
 @router.message(Command("sub"))
@@ -355,12 +379,24 @@ async def cmd_set(message: Message, command: CommandObject, deps: Deps) -> None:
     if not await _require_admin(message, deps):
         return
     parts = (command.args or "").split()
+    if len(parts) == 3 and parts[0].lower() in ("окно", "lookback"):
+        tf = parse_timeframe(parts[1])
+        if tf is None or tf not in deps.settings.intervals or not parts[2].isdigit() or not 1 <= int(parts[2]) <= 500:
+            await message.answer("Использование: <code>/set окно 4h 6</code> (окно 1…500 свечей)")
+            return
+        deps.settings.lookbacks[tf] = int(parts[2])
+        deps.scanner.invalidate()
+        await message.answer(f"✅ Окно сравнения для {tf_name(tf)} = {parts[2]} свечей\n\n" + format_settings(deps.settings))
+        return
     if len(parts) != 2 or parts[0].lower() not in _SET_PARAMS:
         await message.answer(
             "Использование: <code>/set параметр значение</code>\n"
             "Параметры: " + ", ".join(sorted(set(_SET_PARAMS)))
         )
         return
+    if parts[0].lower() in ("окно", "lookback"):
+        parts = [parts[0], deps.settings.interval, parts[1]]
+        return await cmd_set(message, CommandObject(prefix="/", command="set", args=" ".join(parts)), deps)
     attr, typ, (lo, hi) = _SET_PARAMS[parts[0].lower()]
     try:
         value = typ(parts[1].replace(",", "."))
@@ -412,9 +448,9 @@ async def hourly_scheduler(bot: Bot, deps: Deps) -> None:
 
 
 USER_COMMANDS = [
-    BotCommand(command="top", description="Топ монет по ATR в % цены"),
-    BotCommand(command="exp", description="Топ монет по росту ATR"),
-    BotCommand(command="atr", description="ATR по монете: /atr BTC"),
+    BotCommand(command="top", description="Топ по ATR%: /top, /top 4h, /top 1d, /top 1w"),
+    BotCommand(command="exp", description="Топ по росту ATR: /exp [тф] [N]"),
+    BotCommand(command="atr", description="Монета на всех таймфреймах: /atr BTC"),
     BotCommand(command="sub", description="Авторассылка после закрытия часа"),
     BotCommand(command="unsub", description="Отключить рассылку"),
     BotCommand(command="myid", description="Мой Telegram ID и роль"),
