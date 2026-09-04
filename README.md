@@ -209,7 +209,8 @@ docker compose up -d --build
 
 `EXCHANGE` в `.env`:
 
-- `binance_futures` — USDT-M бессрочные контракты Binance (по умолчанию)
+- `binance_futures` — USDT-M бессрочные контракты Binance (по умолчанию). Если `fapi.binance.com`
+  отвечает гео-блокировкой, бот сам переключается на `www.binance.com`, где те же эндпоинты открыты
 - `binance_spot` — спот Binance (с запасным хостом `data-api.binance.vision`, который не гео-блокируется)
 - `bybit` — линейные бессрочные Bybit
 - `okx` — USDT-свопы OKX

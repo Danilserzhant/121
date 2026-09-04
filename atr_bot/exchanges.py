@@ -117,20 +117,38 @@ class BinanceBase(BaseExchange):
     exchange_info_path = ""
     ticker_path = ""
     klines_path = ""
+    HOST_BAN_SECONDS = 1800  # skip a geo-blocked / failing host for this long
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._banned_until: dict[str, float] = {}
+
+    def _ban(self, host: str, reason: str) -> None:
+        if self._banned_until.get(host, 0) < time.time():
+            log.warning("host %s disabled for %ds: %s", host, self.HOST_BAN_SECONDS, reason[:160].replace("\n", " "))
+        self._banned_until[host] = time.time() + self.HOST_BAN_SECONDS
 
     async def _get_any_host(self, path: str, params: dict[str, Any] | None = None) -> Any:
         last_exc: Exception | None = None
-        for host in self.hosts:
+        now = time.time()
+        hosts = [h for h in self.hosts if self._banned_until.get(h, 0) < now] or list(self.hosts)
+        for host in hosts:
             try:
-                data = await self._get(host + path, params)
+                data = await self._get(host + path, params, retries=1 if len(hosts) > 1 else 3)
             except ExchangeError as exc:
                 last_exc = exc
-                log.warning("host %s failed: %s", host, exc)
+                if "451" in str(exc) or "restricted location" in str(exc):
+                    self._ban(host, str(exc))
+                else:
+                    log.warning("host %s failed: %s", host, str(exc)[:160])
                 continue
             # Binance error payloads are dicts with "code" and "msg" (e.g. geo restriction).
             if isinstance(data, dict) and "code" in data and "msg" in data:
-                last_exc = ExchangeError(f"{host}{path}: {data}")
-                log.warning("host %s rejected request: %s", host, data)
+                last_exc = ExchangeError(f"{host}{path}: {str(data)[:160]}")
+                if "restricted location" in str(data.get("msg", "")):
+                    self._ban(host, str(data.get("msg")))
+                else:
+                    log.warning("host %s rejected request: %s", host, str(data)[:160])
                 continue
             return data
         raise last_exc or ExchangeError("no hosts configured")
@@ -164,7 +182,8 @@ class BinanceBase(BaseExchange):
 
 class BinanceFutures(BinanceBase):
     name = "binance_futures"
-    hosts = ("https://fapi.binance.com",)
+    # www.binance.com serves the same /fapi endpoints and is not geo-fenced like fapi.binance.com.
+    hosts = ("https://fapi.binance.com", "https://www.binance.com")
     exchange_info_path = "/fapi/v1/exchangeInfo"
     ticker_path = "/fapi/v1/ticker/24hr"
     klines_path = "/fapi/v1/klines"
