@@ -5,7 +5,7 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 from .config import Settings
-from .formatting import tf_name
+from .formatting import tf_name, tv_url
 from .storage import SUB_KINDS, SUB_TITLES, Store
 
 # Reply keyboard labels (also matched as text by handlers).
@@ -92,7 +92,8 @@ def chart_keyboard(settings: Settings, symbol: str, interval: str) -> InlineKeyb
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=_mark(tf == interval, tf_name(tf)), callback_data=f"chart:{symbol}:{tf}") for tf in settings.intervals],
         [InlineKeyboardButton(text="👀 Следить", callback_data=f"w:add:{symbol}"),
-         InlineKeyboardButton(text="🔎 Карточка", callback_data=f"sym:{symbol}")],
+         InlineKeyboardButton(text="🔎 Карточка", callback_data=f"sym:{symbol}"),
+         InlineKeyboardButton(text="📊 TradingView", url=tv_url(symbol, interval))],
     ])
 
 
@@ -103,7 +104,8 @@ def symbol_keyboard(settings: Settings, symbol: str, watched: bool) -> InlineKey
     )
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"📈 {tf_name(tf)}", callback_data=f"chart:{symbol}:{tf}") for tf in settings.intervals],
-        [watch_btn, InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sym:{symbol}")],
+        [watch_btn, InlineKeyboardButton(text="🔄", callback_data=f"sym:{symbol}"),
+         InlineKeyboardButton(text="📊 TradingView", url=tv_url(symbol, "1h"))],
     ])
 
 
@@ -114,6 +116,7 @@ def watchlist_keyboard(symbols: list[str]) -> InlineKeyboardMarkup:
         rows.append([
             InlineKeyboardButton(text=f"🔎 {short}", callback_data=f"sym:{sym}"),
             InlineKeyboardButton(text="📈", callback_data=f"chart:{sym}:1h"),
+            InlineKeyboardButton(text="📊 TV", url=tv_url(sym, "1h")),
             InlineKeyboardButton(text="✖", callback_data=f"w:rm:{sym}:list"),
         ])
     footer = [InlineKeyboardButton(text="➕ Добавить", callback_data="w:ask"), InlineKeyboardButton(text="🔄 Обновить", callback_data="w:refresh")]

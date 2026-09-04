@@ -89,6 +89,8 @@ class Settings:
     admin_ids: list[int] = field(default_factory=lambda: _env_list_int("ADMIN_IDS"))
     # Where the subscriber list is stored.
     storage_path: str = field(default_factory=lambda: os.getenv("STORAGE_PATH", "data/store.json"))
+    # TradingView symbol template override, e.g. "BINANCE:{sym}.P" (default depends on EXCHANGE).
+    tv_symbol: str = field(default_factory=lambda: os.getenv("TV_SYMBOL", ""))
     # Optional HTTP(S) proxy for the exchange API (useful where Binance is geo-blocked).
     exchange_proxy: str = field(default_factory=lambda: os.getenv("EXCHANGE_PROXY", ""))
 

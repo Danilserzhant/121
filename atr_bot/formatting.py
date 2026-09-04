@@ -62,6 +62,32 @@ def parse_sort(token: str) -> str | None:
             return by
     return None
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+# TradingView symbol templates per exchange adapter; {sym} = BTCUSDT
+TV_TEMPLATES = {
+    "binance_futures": "BINANCE:{sym}.P",
+    "binance_spot": "BINANCE:{sym}",
+    "bybit": "BYBIT:{sym}.P",
+    "okx": "OKX:{sym}.P",
+}
+TV_INTERVALS = {"1h": "60", "4h": "240", "1d": "D", "1w": "W"}
+_tv_template = TV_TEMPLATES["binance_futures"]
+
+
+def set_tv_exchange(exchange: str, override: str = "") -> None:
+    """Pick the TradingView symbol template (override: e.g. 'BINANCE:{sym}.P')."""
+    global _tv_template
+    _tv_template = override or TV_TEMPLATES.get(exchange, "BINANCE:{sym}.P")
+
+
+def tv_url(symbol: str, interval: str = "1h") -> str:
+    tv_sym = _tv_template.format(sym=symbol).replace(":", "%3A")
+    return f"https://www.tradingview.com/chart/?symbol={tv_sym}&interval={TV_INTERVALS.get(interval, '60')}"
+
+
+def sym_link(symbol: str, interval: str = "1h", text: str | None = None) -> str:
+    """Bold ticker that opens TradingView."""
+    return f'<a href="{tv_url(symbol, interval)}"><b>{html.escape(text or short_symbol(symbol))}</b></a>'
 LINE = "━━━━━━━━━━━━━━━━━━"
 
 
@@ -230,6 +256,7 @@ def _top_footer(result: ScanResult) -> str:
         f"\n<i>ATR — средний ход за {TF_UNIT.get(tf, 'свечу')} · св — последняя свеча · "
         f"Δ — рост ATR за {_window(tf, result.lookback)} · × — объём свечи к среднему · ρ — корреляция с BTC по свечам · "
         f"об. — оборот 24ч · ОИ — открытый интерес и его изменение · 🔺🔻 — экстремальный фандинг · 🔥 — свечей подряд в топ-20 · "
+        f"тикер — ссылка на TradingView · "
         f"обновлено {_now_utc()} UTC</i>"
     )
 
@@ -260,7 +287,7 @@ def format_top(
         rho = f"ρ <b>{_rho(m)}</b>" if (by in ("corr", "corrhi") or corr != "any") else f"ρ {_rho(m)}"
         st = _streak(streaks.get(m.symbol, 0))
         lines.append(
-            f"{num} <b>{short_symbol(m.symbol)}</b>  {_arrow(m.move_pct)} {_sign(m.move_pct)}"
+            f"{num} {sym_link(m.symbol, tf)}  {_arrow(m.move_pct)} {_sign(m.move_pct)}"
             + (f"  {st}" if st else "")
             + f"\n      {atr} · св {m.last_tr_pct:.1f}% · {exp} · {_vol(m.vol_ratio)} · {rho}"
             + f"\n      об. {fmt_big(m.quote_volume)}" + (f" · капа {fmt_big(m.market_cap)}" if m.market_cap else "")
@@ -292,7 +319,7 @@ def format_symbol(symbol: str, per_tf: dict[str, AtrMetrics | None], ranks: dict
     if first is None:
         return f"По <b>{html.escape(symbol)}</b> слишком мало истории."
     head = (
-        f"🔎 <b>{html.escape(symbol)}</b>{'  👀' if watched else ''}\n"
+        f"🔎 {sym_link(symbol, '1h', symbol)}{'  👀' if watched else ''}\n"
         f"Цена <code>{fmt_price(first.close)}</code> · оборот 24ч <b>{fmt_big(first.quote_volume)}</b>"
         + (f" · капа <b>{fmt_big(first.market_cap)}</b>" if first.market_cap else "")
         + (f"\n{_deriv_line(first)}" if _deriv_line(first) else "") + f"\n{LINE}\n"
@@ -323,7 +350,7 @@ def format_breakouts(rows: list[AtrMetrics], interval: str, ratio: float) -> str
     lines = []
     for m in sorted(rows, key=lambda m: m.last_tr_ratio, reverse=True):
         lines.append(
-            f"{_arrow(m.move_pct)} <b>{short_symbol(m.symbol, 12)}</b>  св <b>{m.last_tr_pct:.1f}%</b> = {m.last_tr_ratio:.1f}× ATR"
+            f"{_arrow(m.move_pct)} {sym_link(m.symbol, interval, short_symbol(m.symbol, 12))}  св <b>{m.last_tr_pct:.1f}%</b> = {m.last_tr_ratio:.1f}× ATR"
             f"\n      ATR {m.atr_pct:.2f}% · {_vol(m.vol_ratio)} · ход {_sign(m.move_pct)}"
         )
     return head + "\n".join(lines)
@@ -331,7 +358,7 @@ def format_breakouts(rows: list[AtrMetrics], interval: str, ratio: float) -> str
 
 def format_watch_alert(m: AtrMetrics, interval: str, reasons: list[str]) -> str:
     return (
-        f"👀 {_arrow(m.move_pct)} <b>{html.escape(m.symbol)}</b> · {tf_name(interval)} · свеча {_utc(m.candle_time, interval)} UTC\n"
+        f"👀 {_arrow(m.move_pct)} {sym_link(m.symbol, interval, m.symbol)} · {tf_name(interval)} · свеча {_utc(m.candle_time, interval)} UTC\n"
         + "\n".join(f"• {r}" for r in reasons)
         + f"\n{LINE}\nATR {m.atr_pct:.2f}% · св {m.last_tr_pct:.1f}% ({m.last_tr_ratio:.1f}×) · {_vol(m.vol_ratio)} · "
         f"ход {_sign(m.move_pct)} · цена <code>{fmt_price(m.close)}</code>"
@@ -351,7 +378,7 @@ def format_watchlist(symbols: list[str], metrics: dict[str, AtrMetrics | None], 
             lines.append(f"<b>{short_symbol(sym)}</b>  нет данных")
             continue
         lines.append(
-            f"{_arrow(m.move_pct)} <b>{short_symbol(sym)}</b>  {_sign(m.move_pct)} · <code>{fmt_price(m.close)}</code>"
+            f"{_arrow(m.move_pct)} {sym_link(sym, interval)}  {_sign(m.move_pct)} · <code>{fmt_price(m.close)}</code>"
             f"\n      ATR <b>{m.atr_pct:.1f}%</b> · св {m.last_tr_pct:.1f}% ({m.last_tr_ratio:.1f}×) · Δ {m.expansion_pct:+.0f}% · {_vol(m.vol_ratio)}"
         )
     return (
@@ -437,7 +464,7 @@ def format_overlap(hits: list[tuple[str, dict[str, AtrMetrics]]], intervals: lis
         tfs = " ".join(f"<b>{tf_name(tf)}</b>" for tf in intervals if tf in per_tf)
         first = per_tf[next(tf for tf in intervals if tf in per_tf)]
         details = " · ".join(f"{tf_name(tf)} {m.atr_pct:.1f}%" for tf, m in per_tf.items())
-        lines.append(f"{_arrow(first.move_pct)} <b>{short_symbol(sym)}</b>  {tfs}\n      ATR: {details} · ρ {_rho(first)}")
+        lines.append(f"{_arrow(first.move_pct)} {sym_link(sym, '4h')}  {tfs}\n      ATR: {details} · ρ {_rho(first)}")
     return head + "\n".join(lines) + "\n\n<i>Чем больше таймфреймов совпало, тем выше монета. Обычно это самый рабочий список.</i>"
 
 

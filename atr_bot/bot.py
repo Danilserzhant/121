@@ -27,7 +27,8 @@ from .config import Settings
 from .exchanges import ExchangeError, interval_ms
 from .formatting import (
     DIRECTION_TITLES, HELP, SORTS, VIEWS, format_breakouts, format_settings, format_symbol, format_top, format_watch_alert,
-    format_watchlist, parse_amount, parse_corr_filter, parse_direction, parse_filter, parse_sort, parse_timeframe, tf_name, welcome,
+    format_watchlist, parse_amount, parse_corr_filter, parse_direction, parse_filter, parse_sort, parse_timeframe, set_tv_exchange,
+    tf_name, welcome,
 )
 from .scanner import CORR_FILTERS, ScanResult, Scanner
 from .storage import (
@@ -1098,7 +1099,8 @@ ADMIN_COMMANDS = USER_COMMANDS + [
 async def run_bot(settings: Settings) -> None:
     if not settings.bot_token:
         raise SystemExit("BOT_TOKEN is not set (put it in .env or environment)")
-    bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    set_tv_exchange(settings.exchange, settings.tv_symbol)
+    bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
     await bot.set_my_commands(USER_COMMANDS)
     store = Store(settings.storage_path)
     if settings.owner_id and store.role(settings.owner_id) is None:

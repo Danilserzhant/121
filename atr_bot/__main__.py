@@ -35,6 +35,9 @@ async def _scan_cli(args: argparse.Namespace) -> None:
         settings.interval = args.interval
     if args.volume is not None:
         settings.min_quote_volume = args.volume
+    from .formatting import set_tv_exchange
+
+    set_tv_exchange(settings.exchange, settings.tv_symbol)
     async with Scanner(settings) as scanner:
         if args.symbol:
             per_tf = await scanner.symbol_metrics(args.symbol)

@@ -19,7 +19,7 @@ from . import keyboards as kb
 from .bot import Deps, TopQuery, _parse_top_args, _safe_edit, _scan_and_record, _top_kb, _top_text, show_top
 from .exchanges import ExchangeError
 from .formatting import (
-    _arrow, _sign, format_digest, format_overlap, format_presets, format_prefs, format_queued, parse_timeframe, tf_name,
+    _arrow, _sign, format_digest, format_overlap, format_presets, format_prefs, format_queued, parse_timeframe, sym_link, tf_name,
 )
 from .indicators import AtrMetrics
 
@@ -304,7 +304,7 @@ async def send_digest(bot: Bot, deps: Deps, uid: int) -> None:
     for sym in sorted(watched if metrics else [], key=lambda s: -abs(metrics[s].move_pct) if metrics.get(s) else 0):
         m = metrics.get(sym)
         if m and abs(m.move_pct) >= 2:
-            watch_lines.append(f"  {_arrow(m.move_pct)} <b>{sym.removesuffix('USDT')}</b> {_sign(m.move_pct)} · ATR {m.atr_pct:.1f}% · Δ {m.expansion_pct:+.0f}%")
+            watch_lines.append(f"  {_arrow(m.move_pct)} {sym_link(sym)} {_sign(m.move_pct)} · ATR {m.atr_pct:.1f}% · Δ {m.expansion_pct:+.0f}%")
     breakouts_total = sum(n for _, n in deps.breakout_log)
     queued = deps.store.queue.get(uid, [])
     text = format_digest(name, top_text, queued, breakouts_total, watch_lines)
