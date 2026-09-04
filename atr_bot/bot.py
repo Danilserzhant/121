@@ -59,14 +59,13 @@ async def cmd_start(message: Message) -> None:
     await message.answer(HELP)
 
 
-@router.message(Command("top"))
-async def cmd_top(message: Message, command: CommandObject, deps: Deps) -> None:
+async def _send_top(message: Message, command: CommandObject, deps: Deps, by: str) -> None:
     n = deps.settings.top_n
     if command.args:
         try:
             n = max(1, min(50, int(command.args.strip())))
         except ValueError:
-            await message.answer("Использование: <code>/top 20</code>")
+            await message.answer(f"Использование: <code>/{command.command} 20</code>")
             return
     status = await message.answer("⏳ Сканирую рынок…")
     try:
@@ -75,7 +74,17 @@ async def cmd_top(message: Message, command: CommandObject, deps: Deps) -> None:
         log.exception("scan failed")
         await status.edit_text(f"❌ Ошибка биржи: <code>{exc}</code>")
         return
-    await status.edit_text(format_top(result, n))
+    await status.edit_text(format_top(result, n, by))
+
+
+@router.message(Command("top"))
+async def cmd_top(message: Message, command: CommandObject, deps: Deps) -> None:
+    await _send_top(message, command, deps, by="atr")
+
+
+@router.message(Command("exp"))
+async def cmd_exp(message: Message, command: CommandObject, deps: Deps) -> None:
+    await _send_top(message, command, deps, by="expansion")
 
 
 @router.message(Command("atr"))
@@ -183,7 +192,8 @@ async def run_bot(settings: Settings) -> None:
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.set_my_commands(
         [
-            BotCommand(command="top", description="Топ монет по расширению ATR"),
+            BotCommand(command="top", description="Топ монет по ATR в % цены"),
+            BotCommand(command="exp", description="Топ монет по росту ATR"),
             BotCommand(command="atr", description="ATR по монете: /atr BTC"),
             BotCommand(command="sub", description="Авторассылка после закрытия часа"),
             BotCommand(command="unsub", description="Отключить рассылку"),

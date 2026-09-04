@@ -30,11 +30,14 @@ class ScanResult:
     lookback: int
     scanned_at: float
     total_symbols: int
-    ranked: list[AtrMetrics] = field(default_factory=list)  # sorted by expansion desc
+    ranked: list[AtrMetrics] = field(default_factory=list)  # sorted by ATR% desc
     errors: int = 0
     duration: float = 0.0
 
-    def top(self, n: int) -> list[AtrMetrics]:
+    def top(self, n: int, by: str = "atr") -> list[AtrMetrics]:
+        """Top N by 'atr' (ATR% of price) or 'expansion' (ATR growth)."""
+        if by == "expansion":
+            return sorted(self.ranked, key=lambda m: m.expansion_pct, reverse=True)[:n]
         return self.ranked[:n]
 
     def find(self, symbol: str) -> AtrMetrics | None:
@@ -142,7 +145,7 @@ class Scanner:
 
         metrics = await asyncio.gather(*(one(i) for i in symbols))
         ranked = [m for m in metrics if m is not None and m.atr_pct >= s.min_atr_pct]
-        ranked.sort(key=lambda m: m.expansion_pct, reverse=True)
+        ranked.sort(key=lambda m: m.atr_pct, reverse=True)
         result = ScanResult(
             exchange=self.exchange.name,
             interval=s.interval,

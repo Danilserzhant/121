@@ -25,15 +25,19 @@ def _utc(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%d.%m %H:%M")
 
 
-def format_top(result: ScanResult, n: int) -> str:
-    rows = result.top(n)
+def format_top(result: ScanResult, n: int, by: str = "atr") -> str:
+    rows = result.top(n, by)
     if not rows:
         return "Не удалось получить данные — нет ни одной монеты с достаточной историей."
     candle = _utc(rows[0].candle_time)
+    if by == "expansion":
+        title = f"📈 <b>Топ по росту ATR, {result.interval} свечи</b>"
+    else:
+        title = f"📊 <b>Топ по ATR в % цены, {result.interval} свечи</b>"
     head = (
-        f"📊 <b>ATR-расширение, {result.interval} свечи</b>\n"
+        f"{title}\n"
         f"Биржа: {html.escape(result.exchange)} · свеча {candle} UTC\n"
-        f"ATR({result.atr_period}) сейчас vs {result.lookback} свеч назад · "
+        f"ATR({result.atr_period}), сравнение с {result.lookback} свеч назад · "
         f"{len(result.ranked)} монет\n"
     )
     lines = [f"{'#':>2} {'Монета':<10} {'ATR%':>6} {'ΔATR':>7} {'Свеча':>6} {'Ход':>7}"]
@@ -84,10 +88,11 @@ def format_settings(s) -> str:  # noqa: ANN001 - Settings, avoid circular import
 
 HELP = (
     "🤖 <b>ATR Expansion Bot</b>\n"
-    "Ищу монеты, у которых ATR по часовым свечам вырос сильнее всего "
-    "(волатильность расширяется), и показываю движение в % цены.\n\n"
+    "Считаю ATR по часовым свечам для всех монет биржи и показываю самые "
+    "волатильные — ATR в % цены, то есть чистое движение за час.\n\n"
     "<b>Команды</b>\n"
-    "/top [N] — топ N монет по расширению ATR (по умолчанию из настроек)\n"
+    "/top [N] — топ N монет с самым высоким ATR в % цены (средний ход за час)\n"
+    "/exp [N] — топ N монет по росту ATR (волатильность расширяется)\n"
     "/atr SYMBOL — подробности по монете, например <code>/atr SOL</code>\n"
     "/sub — присылать топ автоматически после закрытия каждой часовой свечи\n"
     "/unsub — отключить рассылку\n"
