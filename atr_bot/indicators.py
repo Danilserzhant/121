@@ -72,8 +72,13 @@ class AtrMetrics:
     last_tr_pct: float    # true range of the last closed candle in % of price
     last_tr_ratio: float  # last_tr_pct / atr_prev_pct (how many "old" ATRs the last bar moved)
     move_pct: float       # net close-to-close move over the lookback window, %
+    vol_ratio: float      # last candle volume / average volume of the lookback window
     quote_volume: float   # 24h quote volume
     candle_time: int      # open time (ms) of the last candle used
+
+    @property
+    def direction(self) -> str:
+        return "long" if self.move_pct > 0 else "short" if self.move_pct < 0 else "flat"
 
 
 def compute_metrics(
@@ -104,6 +109,9 @@ def compute_metrics(
     prev_close = candles[prev_i].close
     if last.close <= 0 or prev_close <= 0:
         return None
+    window = candles[prev_i:now_i]
+    avg_vol = sum(c.volume for c in window) / len(window) if window else 0.0
+    vol_ratio = last.volume / avg_vol if avg_vol > 0 else 0.0
     return AtrMetrics(
         symbol=symbol,
         close=last.close,
@@ -115,6 +123,12 @@ def compute_metrics(
         last_tr_pct=trs_pct[now_i],
         last_tr_ratio=trs_pct[now_i] / atr_prev_pct,
         move_pct=(last.close / prev_close - 1) * 100,
+        vol_ratio=vol_ratio,
         quote_volume=quote_volume,
         candle_time=last.open_time,
     )
+
+
+def atr_pct_series(candles: Sequence[Candle], period: int) -> list[float | None]:
+    """ATR% for every candle (used for charts)."""
+    return wilder_atr(true_ranges_pct(candles), period)

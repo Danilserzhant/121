@@ -32,6 +32,8 @@ def test_compute_metrics_expansion():
     assert m.atr_pct > m.atr_prev_pct
     assert abs(m.move_pct - (110 / 100 - 1) * 100) < 1e-9
     assert abs(m.last_tr_pct - 25 / 105 * 100) < 1e-9  # % of previous close
+    assert m.vol_ratio == 1.0  # all volumes equal
+    assert m.direction == "long"
 
 
 def test_atr_pct_is_scale_invariant():

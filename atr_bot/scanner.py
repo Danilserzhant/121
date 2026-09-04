@@ -12,7 +12,7 @@ import aiohttp
 
 from .config import Settings
 from .exchanges import BaseExchange, ExchangeError, SymbolInfo, make_exchange
-from .indicators import AtrMetrics, compute_metrics
+from .indicators import AtrMetrics, Candle, compute_metrics
 
 log = logging.getLogger(__name__)
 
@@ -35,11 +35,20 @@ class ScanResult:
     errors: int = 0
     duration: float = 0.0
 
-    def top(self, n: int, by: str = "atr") -> list[AtrMetrics]:
-        """Top N by 'atr' (ATR% of price) or 'expansion' (ATR growth)."""
+    def top(self, n: int, by: str = "atr", direction: str = "all") -> list[AtrMetrics]:
+        """Top N by 'atr' (ATR% of price) or 'expansion' (ATR growth), optionally only long/short movers."""
+        rows = self.ranked
+        if direction == "long":
+            rows = [m for m in rows if m.move_pct > 0]
+        elif direction == "short":
+            rows = [m for m in rows if m.move_pct < 0]
         if by == "expansion":
-            return sorted(self.ranked, key=lambda m: m.expansion_pct, reverse=True)[:n]
-        return self.ranked[:n]
+            rows = sorted(rows, key=lambda m: m.expansion_pct, reverse=True)
+        return rows[:n]
+
+    @property
+    def candle_time(self) -> int:
+        return self.ranked[0].candle_time if self.ranked else 0
 
     def find(self, symbol: str) -> AtrMetrics | None:
         symbol = symbol.upper()
@@ -189,3 +198,44 @@ class Scanner:
 
         results = await asyncio.gather(*(one(tf) for tf in intervals))
         return dict(zip(intervals, results))
+
+    async def metrics_for(self, symbols: Sequence[str], interval: str) -> dict[str, AtrMetrics | None]:
+        """Metrics for a list of symbols on one interval; uses the cached scan when it has them."""
+        cached = self._last.get(interval)
+        out: dict[str, AtrMetrics | None] = {}
+        missing: list[str] = []
+        for sym in symbols:
+            m = cached.find(sym) if cached else None
+            if m is not None:
+                out[sym] = m
+            else:
+                missing.append(sym)
+        if missing:
+            all_symbols = await self.exchange.list_symbols()
+            by_name = {i.symbol: i for i in all_symbols}
+            sem = asyncio.Semaphore(self.settings.concurrency)
+
+            async def one(sym: str) -> AtrMetrics | None:
+                info = by_name.get(sym)
+                if info is None:
+                    return None
+                async with sem:
+                    try:
+                        candles = await self.exchange.fetch_candles(info, interval, self.settings.candles_needed(interval))
+                    except ExchangeError as exc:
+                        log.warning("%s: %s", sym, exc)
+                        return None
+                return compute_metrics(sym, candles, self.settings.atr_period, self.settings.lookback_for(interval), info.quote_volume)
+
+            for sym, m in zip(missing, await asyncio.gather(*(one(s) for s in missing))):
+                out[sym] = m
+        return out
+
+    async def candles(self, symbol: str, interval: str, limit: int) -> list[Candle] | None:
+        """Raw closed candles for charts. None if the symbol is unknown."""
+        symbol = self.normalize_symbol(symbol)
+        all_symbols = await self.exchange.list_symbols()
+        info = next((i for i in all_symbols if i.symbol == symbol), None)
+        if info is None:
+            return None
+        return await self.exchange.fetch_candles(info, interval, limit)

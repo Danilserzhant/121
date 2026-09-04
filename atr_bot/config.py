@@ -67,6 +67,17 @@ class Settings:
     cache_ttl: int = field(default_factory=lambda: _env_int("CACHE_TTL", 60))
     # Seconds after the hourly candle close to wait before the auto scan.
     close_delay: int = field(default_factory=lambda: _env_int("CLOSE_DELAY", 20))
+    # Breakout alert: last closed candle's true range >= this many "old" ATRs …
+    alert_tr_ratio: float = field(default_factory=lambda: _env_float("ALERT_TR_RATIO", 2.5))
+    # … and at least this big in % of price (filters noise on dead coins).
+    alert_min_tr_pct: float = field(default_factory=lambda: _env_float("ALERT_MIN_TR_PCT", 1.0))
+    # Watchlist alerts: candle >= this many old ATRs, or ATR% grew by this many % vs the lookback.
+    watch_tr_ratio: float = field(default_factory=lambda: _env_float("WATCH_TR_RATIO", 2.0))
+    watch_expansion_pct: float = field(default_factory=lambda: _env_float("WATCH_EXPANSION_PCT", 50.0))
+    # How many symbols per interval to remember for "how long in the top" streaks.
+    history_top: int = field(default_factory=lambda: _env_int("HISTORY_TOP", 20))
+    # Chart: number of candles to draw.
+    chart_candles: int = field(default_factory=lambda: _env_int("CHART_CANDLES", 120))
     # Telegram user id of the bot owner. If empty, the first person who sends
     # /start to a fresh bot becomes the owner.
     owner_id: int = field(default_factory=lambda: _env_int("OWNER_ID", 0))
