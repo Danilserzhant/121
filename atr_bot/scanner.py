@@ -94,6 +94,11 @@ class Scanner:
     def last(self) -> ScanResult | None:
         return self._last
 
+    def invalidate(self) -> None:
+        """Drop cached results (after settings change)."""
+        self._last = None
+        self._symbols_cache = None
+
     async def symbols(self) -> list[SymbolInfo]:
         """Tradable symbols filtered by quote volume, cached for 10 minutes."""
         now = time.time()

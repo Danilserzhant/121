@@ -50,10 +50,13 @@ class Settings:
     cache_ttl: int = field(default_factory=lambda: _env_int("CACHE_TTL", 60))
     # Seconds after the hourly candle close to wait before the auto scan.
     close_delay: int = field(default_factory=lambda: _env_int("CLOSE_DELAY", 20))
-    # Chat ids that are allowed to change settings; empty = everyone.
+    # Telegram user id of the bot owner. If empty, the first person who sends
+    # /start to a fresh bot becomes the owner.
+    owner_id: int = field(default_factory=lambda: _env_int("OWNER_ID", 0))
+    # Extra admin user ids granted on startup (comma separated).
     admin_ids: list[int] = field(default_factory=lambda: _env_list_int("ADMIN_IDS"))
     # Where the subscriber list is stored.
-    storage_path: str = field(default_factory=lambda: os.getenv("STORAGE_PATH", "data/subscribers.json"))
+    storage_path: str = field(default_factory=lambda: os.getenv("STORAGE_PATH", "data/store.json"))
     # Optional HTTP(S) proxy for the exchange API (useful where Binance is geo-blocked).
     exchange_proxy: str = field(default_factory=lambda: os.getenv("EXCHANGE_PROXY", ""))
 
