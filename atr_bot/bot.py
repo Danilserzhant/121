@@ -27,9 +27,9 @@ from .config import Settings
 from .exchanges import ExchangeError, interval_ms
 from .formatting import (
     DIRECTION_TITLES, HELP, SORTS, VIEWS, format_breakouts, format_settings, format_symbol, format_top, format_watch_alert,
-    format_watchlist, parse_amount, parse_direction, parse_filter, parse_sort, parse_timeframe, tf_name, welcome,
+    format_watchlist, parse_amount, parse_corr_filter, parse_direction, parse_filter, parse_sort, parse_timeframe, tf_name, welcome,
 )
-from .scanner import ScanResult, Scanner
+from .scanner import CORR_FILTERS, ScanResult, Scanner
 from .storage import (
     ROLE_ADMIN, ROLE_OWNER, ROLE_TRADER, ROLE_TITLES, SUB_1D, SUB_1H, SUB_ALERTS, SUB_KINDS, SUB_TITLES, Store, User,
 )
@@ -221,7 +221,7 @@ async def btn_cancel(message: Message, deps: Deps, state: FSMContext) -> None:
 class TopQuery:
     """Everything that defines one top view."""
 
-    FIELDS = ("by", "interval", "n", "direction", "view", "min_volume", "min_cap")
+    FIELDS = ("by", "interval", "n", "direction", "view", "min_volume", "min_cap", "corr")
 
     def __init__(self, settings: Settings, by: str = "atr"):
         self.by = by
@@ -231,6 +231,7 @@ class TopQuery:
         self.view = "list"
         self.min_volume = 0.0
         self.min_cap = 0.0
+        self.corr = "any"
 
     def to_dict(self) -> dict:
         return {f: getattr(self, f) for f in self.FIELDS}
@@ -245,15 +246,15 @@ class TopQuery:
 
     @classmethod
     def from_callback(cls, settings: Settings, parts: list[str]) -> "TopQuery | None":
-        """parts = [by, interval, n, direction, view, vol_millions, cap_millions]."""
-        if len(parts) < 7:
+        """parts = [by, interval, n, direction, view, vol_millions, cap_millions, corr]."""
+        if len(parts) < 8:
             return None
-        by, interval, n_s, direction, view, vol_s, cap_s = parts[:7]
+        by, interval, n_s, direction, view, vol_s, cap_s, corr = parts[:8]
         if (interval not in settings.intervals or by not in SORTS or direction not in DIRECTION_TITLES
-                or view not in VIEWS or not vol_s.isdigit() or not cap_s.isdigit()):
+                or view not in VIEWS or not vol_s.isdigit() or not cap_s.isdigit() or corr not in CORR_FILTERS):
             return None
         q = cls(settings, by)
-        q.interval, q.direction, q.view = interval, direction, view
+        q.interval, q.direction, q.view, q.corr = interval, direction, view, corr
         q.n = max(1, min(50, int(n_s))) if n_s.isdigit() else settings.top_n
         q.min_volume, q.min_cap = int(vol_s) * 1e6, int(cap_s) * 1e6
         return q
@@ -269,11 +270,14 @@ def _parse_top_args(args: str | None, settings: Settings, by: str) -> TopQuery |
         tf = parse_timeframe(token)
         d = parse_direction(token)
         srt = parse_sort(token)
+        cf = parse_corr_filter(token)
         f = parse_filter(token)
         if tf is not None and tf in settings.intervals:
             q.interval = tf
         elif d is not None:
             q.direction = d
+        elif cf is not None:
+            q.corr = cf
         elif srt is not None:
             q.by = srt
         elif f is not None:
@@ -306,13 +310,13 @@ async def _scan_and_record(deps: Deps, interval: str, force: bool = False) -> Sc
 
 
 def _top_text(deps: Deps, result: ScanResult, q: TopQuery) -> str:
-    rows = result.top(q.n, q.by, q.direction, q.min_volume, q.min_cap)
+    rows = result.top(q.n, q.by, q.direction, q.min_volume, q.min_cap, q.corr)
     streaks = deps.store.streaks(result.interval, result.candle_time, [m.symbol for m in rows]) if rows else {}
-    return format_top(result, q.n, q.by, q.direction, streaks, q.view, q.min_volume, q.min_cap)
+    return format_top(result, q.n, q.by, q.direction, streaks, q.view, q.min_volume, q.min_cap, q.corr)
 
 
 def _top_kb(deps: Deps, q: TopQuery):
-    return kb.top_keyboard(deps.settings, q.by, q.interval, q.n, q.direction, q.view, q.min_volume, q.min_cap)
+    return kb.top_keyboard(deps.settings, q.by, q.interval, q.n, q.direction, q.view, q.min_volume, q.min_cap, q.corr)
 
 
 async def show_top(message: Message, deps: Deps, q: TopQuery, edit: bool = False, force: bool = False) -> None:
@@ -331,8 +335,8 @@ async def _send_top(message: Message, command: CommandObject, deps: Deps, by: st
     if q is None:
         tfs = ", ".join(deps.settings.intervals)
         await message.answer(
-            f"Использование: <code>/{command.command} [таймфрейм] [N] [long|short] [vol 20m] [cap 1b]</code>\n"
-            f"Например <code>/{command.command} 4h 20 long cap 300m</code>. Таймфреймы: {tfs}"
+            f"Использование: <code>/{command.command} [таймфрейм] [N] [long|short] [vol 20m] [cap 1b] [сами|вместе]</code>\n"
+            f"Например <code>/{command.command} 4h 20 long cap 300m сами</code>. Таймфреймы: {tfs}"
         )
         return
     await show_top(message, deps, q)
@@ -368,11 +372,11 @@ async def btn_exp(message: Message, deps: Deps, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("top:"))
 async def cb_top(query: CallbackQuery, deps: Deps) -> None:
     parts = query.data.split(":")
-    q = TopQuery.from_callback(deps.settings, parts[1:8])
+    q = TopQuery.from_callback(deps.settings, parts[1:9])
     if q is None:
         await query.answer()
         return
-    refresh = len(parts) > 8 and parts[8] == "r"
+    refresh = len(parts) > 9 and parts[9] == "r"
     await query.answer("Обновляю…" if refresh else None)
     await show_top(query.message, deps, q, edit=True, force=refresh)
 

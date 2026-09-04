@@ -18,6 +18,14 @@ from .marketcap import MarketCapProvider
 
 log = logging.getLogger(__name__)
 
+# Correlation-with-BTC filters for ScanResult.top()
+CORR_FILTERS = {
+    "any": lambda r: True,
+    "lo": lambda r: abs(r) < 0.3,
+    "mid": lambda r: abs(r) < 0.5,
+    "hi": lambda r: r > 0.7,
+}
+
 # Stablecoins and wrapped fiat: their "volatility" is noise, never rank them.
 STABLE_BASES = {
     "USDC", "USDT", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USD1", "USDE", "PYUSD",
@@ -39,12 +47,13 @@ class ScanResult:
 
     def top(
         self, n: int, by: str = "atr", direction: str = "all", min_volume: float = 0.0, min_cap: float = 0.0,
+        corr: str = "any",
     ) -> list[AtrMetrics]:
         """Top N with optional filters.
 
         by: 'atr' (ATR% of price), 'expansion' (ATR growth), 'corr' (least correlated with BTC first),
         'corrhi' (most correlated first). min_volume: 24h quote volume floor; min_cap: market cap floor
-        (coins with unknown cap are dropped).
+        (coins with unknown cap are dropped). corr: 'any' | 'lo' (|ρ|<0.3) | 'mid' (|ρ|<0.5) | 'hi' (ρ>0.7).
         """
         rows = self.ranked
         if direction == "long":
@@ -55,6 +64,8 @@ class ScanResult:
             rows = [m for m in rows if m.quote_volume >= min_volume]
         if min_cap > 0:
             rows = [m for m in rows if m.market_cap >= min_cap]
+        if corr in CORR_FILTERS and corr != "any":
+            rows = [m for m in rows if m.btc_corr is not None and CORR_FILTERS[corr](m.btc_corr)]
         if by == "expansion":
             rows = sorted(rows, key=lambda m: m.expansion_pct, reverse=True)
         elif by in ("corr", "corrhi"):

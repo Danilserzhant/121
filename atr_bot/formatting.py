@@ -26,6 +26,21 @@ DIRECTION_ALIASES = {
 DIRECTION_TITLES = {"long": "🟢 только рост", "short": "🔴 только падение", "all": ""}
 VIEWS = ("list", "table")
 SORTS = ("atr", "expansion", "corr", "corrhi")
+CORR_TITLES = {"any": "", "lo": "|ρ| &lt; 0.3", "mid": "|ρ| &lt; 0.5", "hi": "ρ &gt; 0.7"}  # HTML-escaped
+CORR_ALIASES = {
+    "lo": {"indep", "independent", "независимые", "сами", "ρ<0.3", "corr<0.3", "p<0.3"},
+    "mid": {"ρ<0.5", "corr<0.5", "p<0.5"},
+    "hi": {"withbtc", "сbtc", "сбтк", "вместе", "ρ>0.7", "corr>0.7", "p>0.7"},
+    "any": {"ρ", "corr=any", "любая"},
+}
+
+
+def parse_corr_filter(token: str) -> str | None:
+    t = token.strip().lower()
+    for c, names in CORR_ALIASES.items():
+        if t in names:
+            return c
+    return None
 SORT_TITLES = {
     "atr": "📊 Топ по ATR%",
     "expansion": "📈 Топ по росту ATR",
@@ -190,7 +205,7 @@ def _deriv_line(m: AtrMetrics) -> str:
     return " · ".join(parts)
 
 
-def _top_header(result: ScanResult, by: str, direction: str, min_volume: float = 0.0, min_cap: float = 0.0) -> str:
+def _top_header(result: ScanResult, by: str, direction: str, min_volume: float = 0.0, min_cap: float = 0.0, corr: str = "any") -> str:
     tf = result.interval
     title = SORT_TITLES.get(by, SORT_TITLES["atr"])
     dir_txt = f"  {DIRECTION_TITLES[direction]}" if direction != "all" else ""
@@ -199,6 +214,8 @@ def _top_header(result: ScanResult, by: str, direction: str, min_volume: float =
         filters.append(f"оборот ≥ {fmt_big(min_volume)}")
     if min_cap > 0:
         filters.append(f"капа ≥ {fmt_big(min_cap)}")
+    if corr != "any":
+        filters.append(("🧭 сами по себе, " if corr in ("lo", "mid") else "🔗 вместе с BTC, ") + CORR_TITLES.get(corr, ""))
     filt = ("\n<i>🔍 " + " · ".join(filters) + "</i>") if filters else ""
     return (
         f"<b>{title} · {tf_name(tf)}</b>{dir_txt}\n"
@@ -226,9 +243,10 @@ def format_top(
     view: str = "list",
     min_volume: float = 0.0,
     min_cap: float = 0.0,
+    corr: str = "any",
 ) -> str:
-    rows = result.top(n, by, direction, min_volume, min_cap)
-    head = _top_header(result, by, direction, min_volume, min_cap)
+    rows = result.top(n, by, direction, min_volume, min_cap, corr)
+    head = _top_header(result, by, direction, min_volume, min_cap, corr)
     if not rows:
         return head + "\nНичего не нашлось под этот фильтр."
     streaks = streaks or {}
@@ -239,7 +257,7 @@ def format_top(
         num = MEDALS.get(i, f"{i}.")
         atr = f"ATR <b>{m.atr_pct:.1f}%</b>" if by == "atr" else f"ATR {m.atr_pct:.1f}%"
         exp = f"Δ <b>{m.expansion_pct:+.0f}%</b>" if by == "expansion" else f"Δ {m.expansion_pct:+.0f}%"
-        rho = f"ρ <b>{_rho(m)}</b>" if by in ("corr", "corrhi") else f"ρ {_rho(m)}"
+        rho = f"ρ <b>{_rho(m)}</b>" if (by in ("corr", "corrhi") or corr != "any") else f"ρ {_rho(m)}"
         st = _streak(streaks.get(m.symbol, 0))
         lines.append(
             f"{num} <b>{short_symbol(m.symbol)}</b>  {_arrow(m.move_pct)} {_sign(m.move_pct)}"
@@ -386,8 +404,8 @@ HELP = (
     "/top 1d 30 long — количество и направление\n"
     "/top vol 20m cap 300m — оборот 24ч и капитализация не меньше\n"
     "/exp [тф] [N] — топ по росту ATR\n"
-    "/corr [тф] — монеты, которые ходят сами по себе (низкая корреляция с BTC)\n"
-    "/top corr+ — наоборот, самые связанные с BTC\n"
+    "/top сами — только независимые от BTC (|ρ| &lt; 0.3), /top вместе — только связанные (ρ &gt; 0.7)\n"
+    "/corr [тф] — отсортировать по корреляции с BTC\n"
     "/atr SOL — карточка монеты на всех таймфреймах\n"
     "/chart SOL 4h — график свечей и ATR\n"
     "/watch SOL ETH · /unwatch SOL · /watchlist — мои монеты\n"
@@ -431,6 +449,8 @@ def preset_title(p: dict) -> str:
         bits.append(f"об≥{fmt_big(p['min_volume'])}")
     if p.get("min_cap"):
         bits.append(f"капа≥{fmt_big(p['min_cap'])}")
+    if p.get("corr", "any") != "any":
+        bits.append(CORR_TITLES.get(p["corr"], ""))
     return " · ".join(b for b in bits if b)
 
 

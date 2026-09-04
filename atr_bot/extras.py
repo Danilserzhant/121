@@ -149,7 +149,7 @@ async def cb_preset(query: CallbackQuery, deps: Deps, state: FSMContext) -> None
     action = parts[1]
     uid = query.from_user.id
     if action == "save":
-        q = TopQuery.from_callback(deps.settings, parts[2:9])
+        q = TopQuery.from_callback(deps.settings, parts[2:10])
         if q is None:
             await query.answer()
             return

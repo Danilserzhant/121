@@ -16,8 +16,9 @@ def test_parse_helpers():
 
 def test_parse_top_args():
     s = Settings()
-    q = _parse_top_args("4h 20 long vol 20m cap>1b table", s, "atr")
-    assert (q.interval, q.n, q.direction, q.view, q.min_volume, q.min_cap) == ("4h", 20, "long", "table", 20e6, 1e9)
+    q = _parse_top_args("4h 20 long vol 20m cap>1b table сами", s, "atr")
+    assert (q.interval, q.n, q.direction, q.view, q.min_volume, q.min_cap, q.corr) == ("4h", 20, "long", "table", 20e6, 1e9, "lo")
+    assert _parse_top_args("вместе", s, "atr").corr == "hi" and _parse_top_args("ρ<0.5", s, "atr").corr == "mid"
     assert _parse_top_args("", s, "expansion").by == "expansion"
     assert _parse_top_args("garbage", s, "atr") is None
     assert _parse_top_args("cap", s, "atr") is None  # missing value
