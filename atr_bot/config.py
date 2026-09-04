@@ -1,0 +1,65 @@
+"""Configuration loaded from environment variables / .env file."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    return int(raw) if raw not in (None, "") else default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    return float(raw) if raw not in (None, "") else default
+
+
+def _env_list_int(name: str) -> list[int]:
+    raw = os.getenv(name, "")
+    return [int(x) for x in raw.replace(";", ",").split(",") if x.strip()]
+
+
+@dataclass
+class Settings:
+    bot_token: str = field(default_factory=lambda: os.getenv("BOT_TOKEN", ""))
+    # Exchange: binance_futures | binance_spot | bybit | okx
+    exchange: str = field(default_factory=lambda: os.getenv("EXCHANGE", "binance_futures"))
+    quote_asset: str = field(default_factory=lambda: os.getenv("QUOTE_ASSET", "USDT"))
+    # Candle interval (only 1h is officially supported by the ranking logic,
+    # but any interval the exchange knows will work).
+    interval: str = field(default_factory=lambda: os.getenv("INTERVAL", "1h"))
+    # ATR period in candles.
+    atr_period: int = field(default_factory=lambda: _env_int("ATR_PERIOD", 14))
+    # How many candles back to compare the current ATR against ("expansion").
+    lookback: int = field(default_factory=lambda: _env_int("EXPANSION_LOOKBACK", 24))
+    # How many coins to show by default.
+    top_n: int = field(default_factory=lambda: _env_int("TOP_N", 15))
+    # Filter out illiquid coins: minimum 24h quote volume (in quote asset).
+    min_quote_volume: float = field(default_factory=lambda: _env_float("MIN_QUOTE_VOLUME", 5_000_000))
+    # Minimum ATR% (average hourly move) to be listed at all.
+    min_atr_pct: float = field(default_factory=lambda: _env_float("MIN_ATR_PCT", 0.0))
+    # Max parallel kline requests to the exchange.
+    concurrency: int = field(default_factory=lambda: _env_int("CONCURRENCY", 8))
+    # Cache scan results for this many seconds (protects from /top spam).
+    cache_ttl: int = field(default_factory=lambda: _env_int("CACHE_TTL", 60))
+    # Seconds after the hourly candle close to wait before the auto scan.
+    close_delay: int = field(default_factory=lambda: _env_int("CLOSE_DELAY", 20))
+    # Chat ids that are allowed to change settings; empty = everyone.
+    admin_ids: list[int] = field(default_factory=lambda: _env_list_int("ADMIN_IDS"))
+    # Where the subscriber list is stored.
+    storage_path: str = field(default_factory=lambda: os.getenv("STORAGE_PATH", "data/subscribers.json"))
+    # Optional HTTP(S) proxy for the exchange API (useful where Binance is geo-blocked).
+    exchange_proxy: str = field(default_factory=lambda: os.getenv("EXCHANGE_PROXY", ""))
+
+    def candles_needed(self) -> int:
+        # Need enough history for a stable Wilder ATR before the lookback window.
+        return self.atr_period * 3 + self.lookback + 2
+
+
+settings = Settings()
