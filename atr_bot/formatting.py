@@ -299,18 +299,29 @@ def format_top(
 
 def _top_table(rows: list[AtrMetrics], by: str, streaks: dict[str, int]) -> str:
     show_streak = any(v > 0 for v in streaks.values())
-    header = f"{'#':>2} {'Монета':<8} {'ATR%':>5} {'Δ%':>5} {'Св%':>5} {'Ход%':>6} {'×об':>4} {'ρBTC':>5} {'Капа':>5}" + ("  Т" if show_streak else "")
+    show_deriv = any(m.funding is not None or m.oi_usd for m in rows)
+    header = f"{'#':>2} {'Монета':<8} {'ATR%':>5} {'Δ%':>5} {'Св%':>5} {'Ход%':>6} {'×об':>4} {'ρBTC':>5} {'Капа':>5}"
+    if show_deriv:
+        header += f" {'Фанд%':>6} {'ОИ':>6} {'ΔОИ%':>5}"
+    if show_streak:
+        header += "  Т"
     lines = [header]
     for i, m in enumerate(rows, start=1):
         line = (
             f"{i:>2} {short_symbol(m.symbol, 8):<8} {m.atr_pct:>5.1f} {m.expansion_pct:>+5.0f} "
             f"{m.last_tr_pct:>5.1f} {m.move_pct:>+6.1f} {m.vol_ratio:>4.1f} {_rho(m):>5} {(fmt_big(m.market_cap) if m.market_cap else '—'):>5}"
         )
+        if show_deriv:
+            fund = f"{m.funding * 100:+.3f}" if m.funding is not None else "—"
+            oi = fmt_big(m.oi_usd) if m.oi_usd else "—"
+            d_oi = m.oi_change_24h if m.oi_change_24h is not None else m.oi_change_1h
+            line += f" {fund:>6} {oi:>6} {(f'{d_oi:+.0f}' if d_oi is not None else '—'):>5}"
         if show_streak:
             st = streaks.get(m.symbol, 0)
             line += f" {'н' if st == 1 else (str(st) if st > 1 else '·'):>2}"
         lines.append(line)
-    return "<pre>" + html.escape("\n".join(lines)) + "</pre>"
+    note = "\n<i>ΔОИ% — за 24ч, пока копится история — за час</i>" if show_deriv else ""
+    return "<pre>" + html.escape("\n".join(lines)) + "</pre>" + note
 
 
 # ------------------------------------------------------------------ symbol card
