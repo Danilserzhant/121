@@ -12,7 +12,7 @@ import aiohttp
 
 from .config import Settings
 from .exchanges import BaseExchange, ExchangeError, SymbolInfo, make_exchange
-from .indicators import AtrMetrics, Candle, compute_metrics
+from .indicators import AtrMetrics, Candle, candle_returns, compute_metrics
 from .marketcap import MarketCapProvider
 
 log = logging.getLogger(__name__)
@@ -39,9 +39,11 @@ class ScanResult:
     def top(
         self, n: int, by: str = "atr", direction: str = "all", min_volume: float = 0.0, min_cap: float = 0.0,
     ) -> list[AtrMetrics]:
-        """Top N by 'atr' (ATR% of price) or 'expansion' (ATR growth) with optional filters.
+        """Top N with optional filters.
 
-        min_volume: 24h quote volume floor; min_cap: market cap floor (coins with unknown cap are dropped).
+        by: 'atr' (ATR% of price), 'expansion' (ATR growth), 'corr' (least correlated with BTC first),
+        'corrhi' (most correlated first). min_volume: 24h quote volume floor; min_cap: market cap floor
+        (coins with unknown cap are dropped).
         """
         rows = self.ranked
         if direction == "long":
@@ -54,6 +56,9 @@ class ScanResult:
             rows = [m for m in rows if m.market_cap >= min_cap]
         if by == "expansion":
             rows = sorted(rows, key=lambda m: m.expansion_pct, reverse=True)
+        elif by in ("corr", "corrhi"):
+            rows = [m for m in rows if m.btc_corr is not None]
+            rows = sorted(rows, key=lambda m: m.btc_corr, reverse=(by == "corrhi"))
         return rows[:n]
 
     @property
@@ -84,6 +89,7 @@ class Scanner:
         self._locks: dict[str, asyncio.Lock] = {}
         self._last: dict[str, ScanResult] = {}
         self._symbols_cache: tuple[float, list[SymbolInfo]] | None = None
+        self._btc_cache: dict[str, tuple[float, dict[int, float]]] = {}  # interval -> (time, returns)
 
     async def __aenter__(self) -> "Scanner":
         await self.open()
@@ -129,6 +135,7 @@ class Scanner:
         """Drop cached results (after settings change)."""
         self._last = {}
         self._symbols_cache = None
+        self._btc_cache = {}
 
     async def symbols(self) -> list[SymbolInfo]:
         """Tradable symbols filtered by quote volume, cached for 10 minutes."""
@@ -147,6 +154,24 @@ class Scanner:
         self._symbols_cache = (now, symbols)
         return symbols
 
+    async def btc_returns(self, interval: str) -> dict[int, float]:
+        """Candle returns of BTC on the interval, cached for cache_ttl seconds."""
+        cached = self._btc_cache.get(interval)
+        if cached and time.time() - cached[0] < self.settings.cache_ttl:
+            return cached[1]
+        symbol = "BTC" + self.settings.quote_asset
+        info = next((i for i in await self.exchange.list_symbols() if i.symbol == symbol), None)
+        if info is None:
+            return {}
+        try:
+            candles = await self.exchange.fetch_candles(info, interval, self.settings.candles_needed(interval))
+        except ExchangeError as exc:
+            log.warning("BTC candles for correlation failed: %s", exc)
+            return {}
+        returns = candle_returns(candles)
+        self._btc_cache[interval] = (time.time(), returns)
+        return returns
+
     async def scan(self, interval: str | None = None, force: bool = False) -> ScanResult:
         """Run a full scan for the interval, or return a fresh-enough cached result."""
         interval = interval or self.settings.interval
@@ -164,6 +189,7 @@ class Scanner:
         started = time.time()
         symbols = await self.symbols()
         await self.mcap.get()  # warm the market cap cache (failures are logged, not fatal)
+        btc = await self.btc_returns(interval)
         sem = asyncio.Semaphore(s.concurrency)
         limit = s.candles_needed(interval)
         lookback = s.lookback_for(interval)
@@ -179,7 +205,7 @@ class Scanner:
                     log.warning("%s: %s", info.symbol, exc)
                     return None
             return compute_metrics(
-                info.symbol, candles, s.atr_period, lookback, info.quote_volume, self.mcap.cap(info.symbol, s.quote_asset)
+                info.symbol, candles, s.atr_period, lookback, info.quote_volume, self.mcap.cap(info.symbol, s.quote_asset), btc
             )
 
         metrics = await asyncio.gather(*(one(i) for i in symbols))
@@ -220,8 +246,11 @@ class Scanner:
         cap = await self._cap(info.symbol)
 
         async def one(interval: str) -> AtrMetrics | None:
-            candles = await self.exchange.fetch_candles(info, interval, self.settings.candles_needed(interval))
-            return compute_metrics(info.symbol, candles, self.settings.atr_period, self.settings.lookback_for(interval), info.quote_volume, cap)
+            candles, btc = await asyncio.gather(
+                self.exchange.fetch_candles(info, interval, self.settings.candles_needed(interval)),
+                self.btc_returns(interval),
+            )
+            return compute_metrics(info.symbol, candles, self.settings.atr_period, self.settings.lookback_for(interval), info.quote_volume, cap, btc)
 
         results = await asyncio.gather(*(one(tf) for tf in intervals))
         return dict(zip(intervals, results))
@@ -240,6 +269,7 @@ class Scanner:
         if missing:
             all_symbols = await self.exchange.list_symbols()
             by_name = {i.symbol: i for i in all_symbols}
+            btc = await self.btc_returns(interval)
             sem = asyncio.Semaphore(self.settings.concurrency)
 
             async def one(sym: str) -> AtrMetrics | None:
@@ -252,7 +282,7 @@ class Scanner:
                     except ExchangeError as exc:
                         log.warning("%s: %s", sym, exc)
                         return None
-                return compute_metrics(sym, candles, self.settings.atr_period, self.settings.lookback_for(interval), info.quote_volume, await self._cap(sym))
+                return compute_metrics(sym, candles, self.settings.atr_period, self.settings.lookback_for(interval), info.quote_volume, await self._cap(sym), btc)
 
             for sym, m in zip(missing, await asyncio.gather(*(one(s) for s in missing))):
                 out[sym] = m

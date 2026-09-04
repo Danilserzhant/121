@@ -1,4 +1,4 @@
-from atr_bot.indicators import Candle, compute_metrics, true_ranges, true_ranges_pct, wilder_atr
+from atr_bot.indicators import Candle, candle_returns, compute_metrics, correlation, true_ranges, true_ranges_pct, wilder_atr
 
 
 def mk(i, o, h, l, c):
@@ -51,3 +51,18 @@ def test_atr_pct_is_scale_invariant():
 def test_compute_metrics_needs_history():
     candles = [mk(i, 1, 2, 0.5, 1) for i in range(5)]
     assert compute_metrics("X", candles, period=14, lookback=24) is None
+
+
+def test_btc_correlation():
+    import math
+    btc = [mk(i, 100, 101, 99, 100 + 5 * math.sin(i)) for i in range(40)]
+    same = [mk(i, 10, 10.1, 9.9, 10 + 0.5 * math.sin(i)) for i in range(40)]   # moves with BTC
+    inverse = [mk(i, 10, 10.1, 9.9, 10 - 0.5 * math.sin(i)) for i in range(40)]  # moves against BTC
+    btc_r = candle_returns(btc)
+    corr_same, n = correlation(candle_returns(same), btc_r)
+    corr_inv, _ = correlation(candle_returns(inverse), btc_r)
+    assert n == 39 and corr_same > 0.99 and corr_inv < -0.99
+    assert correlation({1: 0.1}, {1: 0.1}) == (None, 1)  # too few points
+    m = compute_metrics("X", same, 3, 2, btc_returns=btc_r)
+    assert m is not None and m.btc_corr > 0.99 and m.corr_points == 39
+    assert compute_metrics("X", same, 3, 2).btc_corr is None

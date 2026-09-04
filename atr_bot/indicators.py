@@ -76,6 +76,8 @@ class AtrMetrics:
     quote_volume: float   # 24h quote volume
     candle_time: int      # open time (ms) of the last candle used
     market_cap: float = 0.0  # USD, 0 = unknown
+    btc_corr: float | None = None  # Pearson correlation of candle returns with BTC (None = not enough data)
+    corr_points: int = 0           # how many candles the correlation was computed on
 
     @property
     def direction(self) -> str:
@@ -89,6 +91,7 @@ def compute_metrics(
     lookback: int,
     quote_volume: float = 0.0,
     market_cap: float = 0.0,
+    btc_returns: dict[int, float] | None = None,
 ) -> AtrMetrics | None:
     """Compute ATR expansion metrics for one symbol.
 
@@ -114,6 +117,9 @@ def compute_metrics(
     window = candles[prev_i:now_i]
     avg_vol = sum(c.volume for c in window) / len(window) if window else 0.0
     vol_ratio = last.volume / avg_vol if avg_vol > 0 else 0.0
+    corr, points = (None, 0)
+    if btc_returns:
+        corr, points = correlation(candle_returns(candles), btc_returns)
     return AtrMetrics(
         symbol=symbol,
         close=last.close,
@@ -129,9 +135,37 @@ def compute_metrics(
         quote_volume=quote_volume,
         candle_time=last.open_time,
         market_cap=market_cap,
+        btc_corr=corr,
+        corr_points=points,
     )
 
 
 def atr_pct_series(candles: Sequence[Candle], period: int) -> list[float | None]:
     """ATR% for every candle (used for charts)."""
     return wilder_atr(true_ranges_pct(candles), period)
+
+
+def candle_returns(candles: Sequence[Candle]) -> dict[int, float]:
+    """Close-to-close return of every candle keyed by open time (ms)."""
+    out: dict[int, float] = {}
+    for prev, cur in zip(candles, candles[1:]):
+        if prev.close > 0:
+            out[cur.open_time] = cur.close / prev.close - 1
+    return out
+
+
+def correlation(a: dict[int, float], b: dict[int, float], min_points: int = 10) -> tuple[float | None, int]:
+    """Pearson correlation of two return series aligned by candle time. Returns (corr, points)."""
+    keys = sorted(set(a) & set(b))
+    n = len(keys)
+    if n < min_points:
+        return None, n
+    xs = [a[k] for k in keys]
+    ys = [b[k] for k in keys]
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    if sxx <= 0 or syy <= 0:
+        return None, n
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    return max(-1.0, min(1.0, sxy / (sxx * syy) ** 0.5)), n

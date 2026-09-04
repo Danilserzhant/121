@@ -25,6 +25,27 @@ DIRECTION_ALIASES = {
 }
 DIRECTION_TITLES = {"long": "🟢 только рост", "short": "🔴 только падение", "all": ""}
 VIEWS = ("list", "table")
+SORTS = ("atr", "expansion", "corr", "corrhi")
+SORT_TITLES = {
+    "atr": "📊 Топ по ATR%",
+    "expansion": "📈 Топ по росту ATR",
+    "corr": "🧭 Сами по себе (низкая ρ с BTC)",
+    "corrhi": "🔗 Вместе с BTC (высокая ρ)",
+}
+SORT_ALIASES = {
+    "expansion": {"exp", "expansion", "рост", "расширение", "delta", "δ"},
+    "corr": {"corr", "корр", "independent", "indep", "независимые", "сами", "ρ"},
+    "corrhi": {"corr+", "corrhi", "corrhigh", "withbtc", "сbtc", "сбтк", "вместе", "ρ+"},
+    "atr": {"atr", "атр"},
+}
+
+
+def parse_sort(token: str) -> str | None:
+    t = token.strip().lower()
+    for by, names in SORT_ALIASES.items():
+        if t in names:
+            return by
+    return None
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 LINE = "━━━━━━━━━━━━━━━━━━"
 
@@ -97,6 +118,8 @@ def fmt_price(p: float) -> str:
 
 def fmt_big(v: float) -> str:
     """5_400_000 -> '5.4M', 1_130_000_000 -> '1.13B'."""
+    if v >= 1e12:
+        return f"{v/1e12:.2f}".rstrip("0").rstrip(".") + "T"
     if v >= 1e9:
         return f"{v/1e9:.2f}".rstrip("0").rstrip(".") + "B"
     if v >= 1e6:
@@ -146,9 +169,13 @@ def _now_utc() -> str:
 
 # ------------------------------------------------------------------ top
 
+def _rho(m: AtrMetrics) -> str:
+    return f"{m.btc_corr:+.2f}" if m.btc_corr is not None else "—"
+
+
 def _top_header(result: ScanResult, by: str, direction: str, min_volume: float = 0.0, min_cap: float = 0.0) -> str:
     tf = result.interval
-    title = "📈 Топ по росту ATR" if by == "expansion" else "📊 Топ по ATR%"
+    title = SORT_TITLES.get(by, SORT_TITLES["atr"])
     dir_txt = f"  {DIRECTION_TITLES[direction]}" if direction != "all" else ""
     filters = []
     if min_volume > 0:
@@ -167,7 +194,8 @@ def _top_footer(result: ScanResult) -> str:
     tf = result.interval
     return (
         f"\n<i>ATR — средний ход за {TF_UNIT.get(tf, 'свечу')} · св — последняя свеча · "
-        f"Δ — рост ATR за {_window(tf, result.lookback)} · × — объём свечи к среднему · об. — оборот 24ч · 🔥 — свечей подряд в топ-20 · "
+        f"Δ — рост ATR за {_window(tf, result.lookback)} · × — объём свечи к среднему · ρ — корреляция с BTC по свечам · "
+        f"об. — оборот 24ч · 🔥 — свечей подряд в топ-20 · "
         f"обновлено {_now_utc()} UTC</i>"
     )
 
@@ -194,11 +222,12 @@ def format_top(
         num = MEDALS.get(i, f"{i}.")
         atr = f"ATR <b>{m.atr_pct:.1f}%</b>" if by == "atr" else f"ATR {m.atr_pct:.1f}%"
         exp = f"Δ <b>{m.expansion_pct:+.0f}%</b>" if by == "expansion" else f"Δ {m.expansion_pct:+.0f}%"
+        rho = f"ρ <b>{_rho(m)}</b>" if by in ("corr", "corrhi") else f"ρ {_rho(m)}"
         st = _streak(streaks.get(m.symbol, 0))
         lines.append(
             f"{num} <b>{short_symbol(m.symbol)}</b>  {_arrow(m.move_pct)} {_sign(m.move_pct)}"
             + (f"  {st}" if st else "")
-            + f"\n      {atr} · св {m.last_tr_pct:.1f}% · {exp} · {_vol(m.vol_ratio)}"
+            + f"\n      {atr} · св {m.last_tr_pct:.1f}% · {exp} · {_vol(m.vol_ratio)} · {rho}"
             + f"\n      об. {fmt_big(m.quote_volume)}" + (f" · капа {fmt_big(m.market_cap)}" if m.market_cap else "")
         )
     return head + "\n".join(lines) + _top_footer(result)
@@ -206,12 +235,12 @@ def format_top(
 
 def _top_table(rows: list[AtrMetrics], by: str, streaks: dict[str, int]) -> str:
     show_streak = any(v > 0 for v in streaks.values())
-    header = f"{'#':>2} {'Монета':<8} {'ATR%':>5} {'Δ%':>5} {'Св%':>5} {'Ход%':>6} {'×об':>4} {'Капа':>5}" + ("  Т" if show_streak else "")
+    header = f"{'#':>2} {'Монета':<8} {'ATR%':>5} {'Δ%':>5} {'Св%':>5} {'Ход%':>6} {'×об':>4} {'ρBTC':>5} {'Капа':>5}" + ("  Т" if show_streak else "")
     lines = [header]
     for i, m in enumerate(rows, start=1):
         line = (
             f"{i:>2} {short_symbol(m.symbol, 8):<8} {m.atr_pct:>5.1f} {m.expansion_pct:>+5.0f} "
-            f"{m.last_tr_pct:>5.1f} {m.move_pct:>+6.1f} {m.vol_ratio:>4.1f} {(fmt_big(m.market_cap) if m.market_cap else '—'):>5}"
+            f"{m.last_tr_pct:>5.1f} {m.move_pct:>+6.1f} {m.vol_ratio:>4.1f} {_rho(m):>5} {(fmt_big(m.market_cap) if m.market_cap else '—'):>5}"
         )
         if show_streak:
             st = streaks.get(m.symbol, 0)
@@ -240,12 +269,12 @@ def format_symbol(symbol: str, per_tf: dict[str, AtrMetrics | None], ranks: dict
         rank_txt = f" · #{rank[0]} из {rank[1]}" if rank else ""
         lines.append(
             f"<b>{tf_name(tf):<2}</b>  ATR <b>{m.atr_pct:.2f}%</b> · Δ {m.expansion_pct:+.0f}%\n"
-            f"      св {m.last_tr_pct:.1f}% ({m.last_tr_ratio:.1f}×) · {_arrow(m.move_pct)} {_sign(m.move_pct)} · {_vol(m.vol_ratio)}{rank_txt}"
+            f"      св {m.last_tr_pct:.1f}% ({m.last_tr_ratio:.1f}×) · {_arrow(m.move_pct)} {_sign(m.move_pct)} · {_vol(m.vol_ratio)} · ρ {_rho(m)}{rank_txt}"
         )
     return (
         head + "\n".join(lines) + f"\n{LINE}\n"
         "<i>ATR — средний ход за свечу · Δ — рост ATR к окну · св — последняя свеча и сколько это старых ATR · "
-        "× — объём к среднему · # — место в топе по ATR%</i>"
+        "× — объём к среднему · ρ — корреляция с BTC · # — место в топе по ATR%</i>"
     )
 
 
@@ -318,6 +347,7 @@ def welcome(name: str, is_admin: bool) -> str:
         "Я ищу самые волатильные монеты по ATR в % от цены на 1ч, 4ч, дневных и недельных свечах.\n\n"
         "📊 <b>Топ ATR</b> — кто ходит сильнее всех\n"
         "📈 <b>Рост ATR</b> — у кого волатильность просыпается\n"
+        "🧭 <b>ρ BTC</b> — кто ходит сам по себе, а кто вслед за биткоином\n"
         "👀 <b>Мои монеты</b> — свой список с личными алертами\n"
         "🔎 <b>Монета</b> — карточка и график. Или просто напишите тикер: <code>SOL</code>\n"
         "🔔 <b>Подписки</b> — часовой и дневной топ, алерты «свеча-выброс»\n"
@@ -335,6 +365,8 @@ HELP = (
     "/top 1d 30 long — количество и направление\n"
     "/top vol 20m cap 300m — оборот 24ч и капитализация не меньше\n"
     "/exp [тф] [N] — топ по росту ATR\n"
+    "/corr [тф] — монеты, которые ходят сами по себе (низкая корреляция с BTC)\n"
+    "/top corr+ — наоборот, самые связанные с BTC\n"
     "/atr SOL — карточка монеты на всех таймфреймах\n"
     "/chart SOL 4h — график свечей и ATR\n"
     "/watch SOL ETH · /unwatch SOL · /watchlist — мои монеты\n"
@@ -342,6 +374,7 @@ HELP = (
     "/myid — мой ID и роль · /menu — клавиатура\n"
     f"{LINE}\n"
     "<i>ATR% — средний диапазон свечи в % цены (Wilder 14). "
+    "ρ — корреляция Пирсона свечных доходностей монеты и BTC на том же таймфрейме за окно сканирования. "
     "Δ — насколько ATR вырос к значению N свечей назад. "
     "Свеча-выброс — последняя свеча больше N старых ATR.</i>"
 )

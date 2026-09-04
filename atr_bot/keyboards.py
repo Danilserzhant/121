@@ -61,6 +61,10 @@ def top_keyboard(
     mode_row = [
         InlineKeyboardButton(text=_mark(by == "atr", "ATR%"), callback_data=cb(by_="atr")),
         InlineKeyboardButton(text=_mark(by == "expansion", "ΔATR"), callback_data=cb(by_="expansion")),
+        InlineKeyboardButton(text=_mark(by == "corr", "🧭 ρ низкая"), callback_data=cb(by_="corr")),
+        InlineKeyboardButton(text=_mark(by == "corrhi", "🔗 ρ высокая"), callback_data=cb(by_="corrhi")),
+    ]
+    dir_row = [
         InlineKeyboardButton(text=_mark(direction == "long", "🟢 Long"), callback_data=cb(d="long")),
         InlineKeyboardButton(text=_mark(direction == "short", "🔴 Short"), callback_data=cb(d="short")),
         InlineKeyboardButton(text=_mark(direction == "all", "Все"), callback_data=cb(d="all")),
@@ -78,7 +82,7 @@ def top_keyboard(
     cap_row = [InlineKeyboardButton(text="капа", callback_data="noop")] + [
         InlineKeyboardButton(text=_mark(abs(min_cap - v) < 1, _fmt_floor(v)), callback_data=cb(cap=v)) for v in CAP_CHOICES
     ]
-    return InlineKeyboardMarkup(inline_keyboard=[tf_row, mode_row, vol_row, cap_row, action_row])
+    return InlineKeyboardMarkup(inline_keyboard=[tf_row, mode_row, dir_row, vol_row, cap_row, action_row])
 
 
 def chart_keyboard(settings: Settings, symbol: str, interval: str) -> InlineKeyboardMarkup:

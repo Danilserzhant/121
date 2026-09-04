@@ -26,8 +26,8 @@ from .charts import render_chart
 from .config import Settings
 from .exchanges import ExchangeError, interval_ms
 from .formatting import (
-    DIRECTION_TITLES, HELP, VIEWS, format_breakouts, format_settings, format_symbol, format_top, format_watch_alert,
-    format_watchlist, parse_amount, parse_direction, parse_filter, parse_timeframe, tf_name, welcome,
+    DIRECTION_TITLES, HELP, SORTS, VIEWS, format_breakouts, format_settings, format_symbol, format_top, format_watch_alert,
+    format_watchlist, parse_amount, parse_direction, parse_filter, parse_sort, parse_timeframe, tf_name, welcome,
 )
 from .scanner import ScanResult, Scanner
 from .storage import (
@@ -238,11 +238,14 @@ def _parse_top_args(args: str | None, settings: Settings, by: str) -> TopQuery |
         token = tokens[i]
         tf = parse_timeframe(token)
         d = parse_direction(token)
+        srt = parse_sort(token)
         f = parse_filter(token)
         if tf is not None and tf in settings.intervals:
             q.interval = tf
         elif d is not None:
             q.direction = d
+        elif srt is not None:
+            q.by = srt
         elif f is not None:
             kind, value = f
             if value is None:  # value in the next token
@@ -315,6 +318,11 @@ async def cmd_exp(message: Message, command: CommandObject, deps: Deps) -> None:
     await _send_top(message, command, deps, by="expansion")
 
 
+@router.message(Command("corr"))
+async def cmd_corr(message: Message, command: CommandObject, deps: Deps) -> None:
+    await _send_top(message, command, deps, by="corr")
+
+
 @router.message(F.text == kb.BTN_TOP)
 async def btn_top(message: Message, deps: Deps, state: FSMContext) -> None:
     await state.clear()
@@ -335,7 +343,7 @@ async def cb_top(query: CallbackQuery, deps: Deps) -> None:
         return
     _, by, interval, n_s, direction, view, vol_s, cap_s = parts[:8]
     refresh = len(parts) > 8 and parts[8] == "r"
-    if (interval not in deps.settings.intervals or by not in ("atr", "expansion") or direction not in DIRECTION_TITLES
+    if (interval not in deps.settings.intervals or by not in SORTS or direction not in DIRECTION_TITLES
             or view not in VIEWS or not vol_s.isdigit() or not cap_s.isdigit()):
         await query.answer()
         return
@@ -1023,6 +1031,7 @@ USER_COMMANDS = [
     BotCommand(command="menu", description="Меню"),
     BotCommand(command="top", description="Топ по ATR%: /top, /top 4h, /top 1d long"),
     BotCommand(command="exp", description="Топ по росту ATR: /exp [тф] [N]"),
+    BotCommand(command="corr", description="Кто ходит сам по себе: корреляция с BTC"),
     BotCommand(command="atr", description="Монета на всех таймфреймах: /atr BTC"),
     BotCommand(command="chart", description="График свечей и ATR: /chart BTC 4h"),
     BotCommand(command="watch", description="Следить за монетой: /watch SOL"),
