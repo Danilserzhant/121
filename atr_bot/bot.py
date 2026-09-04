@@ -1,10 +1,11 @@
-"""aiogram handlers, access control, inline keyboards, alerts and schedulers."""
+"""aiogram handlers, access control, menus, alerts and schedulers."""
 
 from __future__ import annotations
 
 import asyncio
 import html
 import logging
+import re
 import time
 from typing import Any, Awaitable, Callable
 
@@ -12,12 +13,15 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
-    BotCommand, BotCommandScopeChat, BufferedInputFile, CallbackQuery, InlineKeyboardButton,
-    InlineKeyboardMarkup, InputMediaPhoto, Message, TelegramObject,
+    BotCommand, BotCommandScopeChat, BufferedInputFile, CallbackQuery, InputMediaPhoto, Message, ReplyKeyboardRemove,
+    TelegramObject,
 )
 
+from . import keyboards as kb
 from .charts import render_chart
 from .config import Settings
 from .exchanges import ExchangeError, interval_ms
@@ -25,7 +29,6 @@ from .formatting import (
     DIRECTION_TITLES, HELP, format_breakouts, format_settings, format_symbol, format_top, format_watch_alert,
     format_watchlist, parse_direction, parse_timeframe, tf_name,
 )
-from .indicators import AtrMetrics
 from .scanner import ScanResult, Scanner
 from .storage import (
     ROLE_ADMIN, ROLE_OWNER, ROLE_TRADER, ROLE_TITLES, SUB_1D, SUB_1H, SUB_ALERTS, SUB_KINDS, SUB_TITLES, Store, User,
@@ -35,8 +38,9 @@ log = logging.getLogger(__name__)
 
 router = Router()
 
-# Commands that work without access.
 PUBLIC_COMMANDS = {"start", "myid", "help"}
+PUBLIC_CALLBACKS = ("req:ask",)
+SYMBOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{1,14}$")
 
 # /set aliases -> Settings attribute, type, (min, max)
 _SET_PARAMS: dict[str, tuple[str, type, tuple[float, float]]] = {
@@ -67,17 +71,18 @@ class Deps:
         self.alerted: dict[tuple[int, str, str], int] = {}
 
 
+class Ask(StatesGroup):
+    symbol = State()      # waiting for a ticker to show the card
+    watch = State()       # waiting for tickers to add to the watchlist
+
+
 ADMIN_HELP = (
     "🛠 <b>Админка</b>\n"
-    "/users — все пользователи и роли\n"
-    "/requests — кто писал боту, но доступа не имеет\n"
-    "/add_trader ID или @username — дать доступ трейдеру\n"
-    "/del_trader ID или @username — забрать доступ\n"
-    "/add_admin ID или @username — назначить админа (только владелец)\n"
-    "/del_admin ID или @username — снять админа (только владелец)\n"
-    "/settings и /set — параметры сканера и алертов\n\n"
-    "<i>По @username можно добавить только того, кто уже писал боту (/start). "
-    "Иначе — по ID, его пользователь узнает командой /myid.</i>"
+    "👥 Пользователи — роли, кнопки «убрать / админ / трейдер»\n"
+    "📨 Заявки — кто писал боту без доступа, одобрение кнопкой\n"
+    "⚙️ Настройки — параметры сканера и алертов кнопками\n\n"
+    "Текстом: /add_trader ID или @username, /del_trader, /add_admin, /del_admin, "
+    "/set параметр значение, /users, /requests"
 )
 
 
@@ -85,6 +90,14 @@ def _command_name(message: Message) -> str | None:
     if not message.text or not message.text.startswith("/"):
         return None
     return message.text.split()[0][1:].split("@")[0].lower()
+
+
+async def _safe_edit(message: Message, text: str, reply_markup: Any = None) -> None:
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc):
+            raise
 
 
 # ------------------------------------------------------------------ access
@@ -116,7 +129,7 @@ class AccessMiddleware(BaseMiddleware):
                 await _set_menu(data["bot"], user.id, ADMIN_COMMANDS)
                 log.info("owner bootstrapped: %s (%s)", user.id, user.username)
                 if isinstance(message, Message):
-                    await message.answer("👑 Вы назначены владельцем бота.")
+                    await message.answer("👑 Вы назначены владельцем бота.", reply_markup=kb.main_menu(True))
         for admin_id in self.deps.settings.admin_ids:
             if store.role(admin_id) is None:
                 await store.set_role(admin_id, ROLE_ADMIN, added_by=0)
@@ -124,6 +137,8 @@ class AccessMiddleware(BaseMiddleware):
         if store.has_access(user.id):
             return await handler(event, data)
         if isinstance(event, CallbackQuery):
+            if event.data and event.data.startswith(PUBLIC_CALLBACKS):
+                return await handler(event, data)
             await event.answer("⛔ Нет доступа", show_alert=True)
             return None
         cmd = _command_name(event)
@@ -132,28 +147,32 @@ class AccessMiddleware(BaseMiddleware):
         if cmd is not None or event.chat.type == "private":
             await event.answer(
                 "⛔ У вас нет доступа к боту.\n"
-                f"Ваш ID: <code>{user.id}</code> — отправьте его администратору."
+                f"Ваш ID: <code>{user.id}</code> — отправьте его администратору или нажмите кнопку.",
+                reply_markup=kb.request_access_keyboard(),
             )
         return None
 
 
-# ------------------------------------------------------------------ public
+# ------------------------------------------------------------------ start / help / menu
 
 @router.message(CommandStart())
-@router.message(Command("help"))
-async def cmd_start(message: Message, deps: Deps) -> None:
+@router.message(Command("help", "menu"))
+@router.message(F.text == kb.BTN_HELP)
+async def cmd_start(message: Message, deps: Deps, state: FSMContext) -> None:
+    await state.clear()
     uid = message.from_user.id
     role = deps.store.role(uid)
     if role is None:
         await message.answer(
             "🤖 <b>ATR Bot</b>\n\nДоступ выдаёт администратор.\n"
-            f"Ваш ID: <code>{uid}</code> — отправьте его администратору, чтобы получить доступ."
+            f"Ваш ID: <code>{uid}</code>. Нажмите кнопку — админы получат заявку.",
+            reply_markup=kb.request_access_keyboard(),
         )
         return
-    text = HELP
-    if deps.store.is_admin(uid):
-        text += "\n\n" + ADMIN_HELP
-    await message.answer(text)
+    is_admin = deps.store.is_admin(uid)
+    text = HELP + ("\n\n" + ADMIN_HELP if is_admin else "")
+    text += "\n\n<i>Подсказка: просто напишите тикер, например <code>SOL</code>, и получите карточку монеты.</i>"
+    await message.answer(text, reply_markup=kb.main_menu(is_admin) if message.chat.type == "private" else None)
 
 
 @router.message(Command("myid"))
@@ -161,6 +180,35 @@ async def cmd_myid(message: Message, deps: Deps) -> None:
     uid = message.from_user.id
     role = deps.store.role(uid)
     await message.answer(f"Ваш ID: <code>{uid}</code>\nРоль: <b>{ROLE_TITLES.get(role, 'нет доступа') if role else 'нет доступа'}</b>")
+
+
+@router.callback_query(F.data == "req:ask")
+async def cb_request_access(query: CallbackQuery, deps: Deps) -> None:
+    user = query.from_user
+    if deps.store.has_access(user.id):
+        await query.answer("У вас уже есть доступ", show_alert=True)
+        return
+    admins = [u for u in deps.store.users.values() if u.role in (ROLE_OWNER, ROLE_ADMIN)]
+    who = f"<code>{user.id}</code>" + (f" · @{html.escape(user.username)}" if user.username else "") + f" · {html.escape(user.full_name)}"
+    sent = 0
+    for admin in admins:
+        try:
+            await query.bot.send_message(admin.id, f"📨 <b>Заявка на доступ</b>\n{who}", reply_markup=kb.approve_keyboard(user.id, admin.role == ROLE_OWNER))
+            sent += 1
+        except (TelegramForbiddenError, TelegramBadRequest):
+            continue
+    await query.answer("Заявка отправлена, ждите ответа" if sent else "Админы недоступны, передайте свой ID вручную", show_alert=True)
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(query: CallbackQuery) -> None:
+    await query.answer()
+
+
+@router.message(F.text == kb.BTN_CANCEL)
+async def btn_cancel(message: Message, deps: Deps, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Отменено.", reply_markup=kb.main_menu(deps.store.is_admin(message.from_user.id)))
 
 
 # ------------------------------------------------------------------ top / exp
@@ -182,30 +230,6 @@ def _parse_top_args(args: str | None, settings: Settings) -> tuple[str, int, str
     return interval, n, direction
 
 
-def _top_keyboard(settings: Settings, by: str, interval: str, n: int, direction: str) -> InlineKeyboardMarkup:
-    def cb(by_=by, tf=interval, n_=n, d=direction) -> str:
-        return f"top:{by_}:{tf}:{n_}:{d}"
-
-    tf_row = [
-        InlineKeyboardButton(text=("· " if tf == interval else "") + tf_name(tf), callback_data=cb(tf=tf))
-        for tf in settings.intervals
-    ]
-    mode_row = [
-        InlineKeyboardButton(text=("· " if by == "atr" else "") + "ATR%", callback_data=cb(by_="atr")),
-        InlineKeyboardButton(text=("· " if by == "expansion" else "") + "ΔATR", callback_data=cb(by_="expansion")),
-        InlineKeyboardButton(text=("· " if direction == "long" else "") + "🟢 Long", callback_data=cb(d="long")),
-        InlineKeyboardButton(text=("· " if direction == "short" else "") + "🔴 Short", callback_data=cb(d="short")),
-        InlineKeyboardButton(text=("· " if direction == "all" else "") + "Все", callback_data=cb(d="all")),
-    ]
-    action_row = [
-        InlineKeyboardButton(text=f"{'· ' if n == 10 else ''}10", callback_data=cb(n_=10)),
-        InlineKeyboardButton(text=f"{'· ' if n == 20 else ''}20", callback_data=cb(n_=20)),
-        InlineKeyboardButton(text=f"{'· ' if n == 30 else ''}30", callback_data=cb(n_=30)),
-        InlineKeyboardButton(text="🔄 Обновить", callback_data=cb() + ":r"),
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=[tf_row, mode_row, action_row])
-
-
 async def _scan_and_record(deps: Deps, interval: str, force: bool = False) -> ScanResult:
     result = await deps.scanner.scan(interval, force=force)
     if result.ranked:
@@ -220,6 +244,17 @@ def _top_text(deps: Deps, result: ScanResult, n: int, by: str, direction: str) -
     return format_top(result, n, by, direction, streaks)
 
 
+async def show_top(message: Message, deps: Deps, by: str, interval: str, n: int, direction: str, edit: bool = False, force: bool = False) -> None:
+    status = message if edit else await message.answer(f"⏳ Сканирую рынок · {tf_name(interval)}…")
+    try:
+        result = await _scan_and_record(deps, interval, force=force)
+    except ExchangeError as exc:
+        log.exception("scan failed")
+        await _safe_edit(status, f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
+        return
+    await _safe_edit(status, _top_text(deps, result, n, by, direction), kb.top_keyboard(deps.settings, by, interval, n, direction))
+
+
 async def _send_top(message: Message, command: CommandObject, deps: Deps, by: str) -> None:
     parsed = _parse_top_args(command.args, deps.settings)
     if parsed is None:
@@ -230,14 +265,7 @@ async def _send_top(message: Message, command: CommandObject, deps: Deps, by: st
         )
         return
     interval, n, direction = parsed
-    status = await message.answer(f"⏳ Сканирую рынок · {tf_name(interval)}…")
-    try:
-        result = await _scan_and_record(deps, interval)
-    except ExchangeError as exc:
-        log.exception("scan failed")
-        await status.edit_text(f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
-        return
-    await status.edit_text(_top_text(deps, result, n, by, direction), reply_markup=_top_keyboard(deps.settings, by, interval, n, direction))
+    await show_top(message, deps, by, interval, n, direction)
 
 
 @router.message(Command("top"))
@@ -248,6 +276,18 @@ async def cmd_top(message: Message, command: CommandObject, deps: Deps) -> None:
 @router.message(Command("exp"))
 async def cmd_exp(message: Message, command: CommandObject, deps: Deps) -> None:
     await _send_top(message, command, deps, by="expansion")
+
+
+@router.message(F.text == kb.BTN_TOP)
+async def btn_top(message: Message, deps: Deps, state: FSMContext) -> None:
+    await state.clear()
+    await show_top(message, deps, "atr", deps.settings.interval, deps.settings.top_n, "all")
+
+
+@router.message(F.text == kb.BTN_EXP)
+async def btn_exp(message: Message, deps: Deps, state: FSMContext) -> None:
+    await state.clear()
+    await show_top(message, deps, "expansion", deps.settings.interval, deps.settings.top_n, "all")
 
 
 @router.callback_query(F.data.startswith("top:"))
@@ -263,38 +303,20 @@ async def cb_top(query: CallbackQuery, deps: Deps) -> None:
         return
     n = max(1, min(50, int(n_s))) if n_s.isdigit() else deps.settings.top_n
     await query.answer("Обновляю…" if refresh else None)
-    try:
-        result = await _scan_and_record(deps, interval, force=refresh)
-    except ExchangeError as exc:
-        await query.message.answer(f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
-        return
-    try:
-        await query.message.edit_text(
-            _top_text(deps, result, n, by, direction),
-            reply_markup=_top_keyboard(deps.settings, by, interval, n, direction),
-        )
-    except TelegramBadRequest as exc:
-        if "message is not modified" not in str(exc):
-            raise
-        await query.answer("Без изменений")
+    await show_top(query.message, deps, by, interval, n, direction, edit=True, force=refresh)
 
 
-# ------------------------------------------------------------------ symbol / chart
+# ------------------------------------------------------------------ symbol card / chart
 
-@router.message(Command("atr"))
-async def cmd_atr(message: Message, command: CommandObject, deps: Deps) -> None:
-    if not command.args:
-        await message.answer("Использование: <code>/atr BTC</code> или <code>/atr BTCUSDT</code>")
-        return
-    symbol = command.args.split()[0]
-    status = await message.answer("⏳ Считаю…")
+async def show_symbol(message: Message, deps: Deps, uid: int, symbol: str, edit: bool = False) -> None:
+    status = message if edit else await message.answer("⏳ Считаю…")
     try:
         per_tf = await deps.scanner.symbol_metrics(symbol)
     except ExchangeError as exc:
-        await status.edit_text(f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
+        await _safe_edit(status, f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
         return
     if per_tf is None:
-        await status.edit_text(f"Не нашёл монету <code>{html.escape(symbol.upper())}</code> на {deps.settings.exchange}.")
+        await _safe_edit(status, f"Не нашёл монету <code>{html.escape(symbol.upper())}</code> на {deps.settings.exchange}.")
         return
     name = deps.scanner.normalize_symbol(symbol)
     ranks: dict[str, tuple[int, int]] = {}
@@ -303,17 +325,43 @@ async def cmd_atr(message: Message, command: CommandObject, deps: Deps) -> None:
         rank = last.rank_of(name) if last else None
         if last and rank:
             ranks[tf] = (rank, len(last.ranked))
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"📈 {tf_name(tf)}", callback_data=f"chart:{name}:{tf}") for tf in deps.settings.intervals
-    ]])
-    await status.edit_text(format_symbol(name, per_tf, ranks), reply_markup=kb)
+    watched = name in deps.store.watchlist(uid)
+    await _safe_edit(status, format_symbol(name, per_tf, ranks), kb.symbol_keyboard(deps.settings, name, watched))
 
 
-def _chart_keyboard(settings: Settings, symbol: str, interval: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=("· " if tf == interval else "") + tf_name(tf), callback_data=f"chart:{symbol}:{tf}")
-        for tf in settings.intervals
-    ]])
+@router.message(Command("atr"))
+async def cmd_atr(message: Message, command: CommandObject, deps: Deps) -> None:
+    if not command.args:
+        await message.answer("Использование: <code>/atr BTC</code> или <code>/atr BTCUSDT</code>")
+        return
+    await show_symbol(message, deps, message.from_user.id, command.args.split()[0])
+
+
+@router.message(F.text == kb.BTN_SYMBOL)
+async def btn_symbol(message: Message, state: FSMContext) -> None:
+    await state.set_state(Ask.symbol)
+    await message.answer("Введите тикер, например <code>SOL</code> или <code>BTCUSDT</code>:", reply_markup=kb.cancel_menu())
+
+
+@router.message(StateFilter(Ask.symbol), F.text, ~F.text.in_(kb.MENU_BUTTONS))
+async def ask_symbol_input(message: Message, deps: Deps, state: FSMContext) -> None:
+    await state.clear()
+    token = message.text.strip().split()[0]
+    if not SYMBOL_RE.match(token):
+        await message.answer("Это не похоже на тикер.", reply_markup=kb.main_menu(deps.store.is_admin(message.from_user.id)))
+        return
+    await message.answer("Ок", reply_markup=kb.main_menu(deps.store.is_admin(message.from_user.id)))
+    await show_symbol(message, deps, message.from_user.id, token)
+
+
+@router.callback_query(F.data.startswith("sym:"))
+async def cb_symbol(query: CallbackQuery, deps: Deps) -> None:
+    symbol = query.data.split(":", 1)[1]
+    await query.answer()
+    if query.message.photo:  # came from a chart: send a new card instead of editing the photo
+        await show_symbol(query.message, deps, query.from_user.id, symbol)
+    else:
+        await show_symbol(query.message, deps, query.from_user.id, symbol, edit=True)
 
 
 async def _chart_png(deps: Deps, symbol: str, interval: str) -> tuple[str, bytes] | None:
@@ -321,9 +369,7 @@ async def _chart_png(deps: Deps, symbol: str, interval: str) -> tuple[str, bytes
     if candles is None:
         return None
     name = deps.scanner.normalize_symbol(symbol)
-    png = await asyncio.get_running_loop().run_in_executor(
-        None, render_chart, name, interval, candles, deps.settings.atr_period
-    )
+    png = await asyncio.get_running_loop().run_in_executor(None, render_chart, name, interval, candles, deps.settings.atr_period)
     return name, png
 
 
@@ -354,7 +400,7 @@ async def cmd_chart(message: Message, command: CommandObject, deps: Deps) -> Non
     await message.answer_photo(
         BufferedInputFile(png, filename=f"{name}_{interval}.png"),
         caption=f"{name} · {tf_name(interval)} · ATR({deps.settings.atr_period})",
-        reply_markup=_chart_keyboard(deps.settings, name, interval),
+        reply_markup=kb.chart_keyboard(deps.settings, name, interval),
     )
 
 
@@ -373,33 +419,39 @@ async def cb_chart(query: CallbackQuery, deps: Deps) -> None:
     if res is None:
         return
     name, png = res
-    media = InputMediaPhoto(
-        media=BufferedInputFile(png, filename=f"{name}_{interval}.png"),
-        caption=f"{name} · {tf_name(interval)} · ATR({deps.settings.atr_period})",
-    )
-    kb = _chart_keyboard(deps.settings, name, interval)
+    caption = f"{name} · {tf_name(interval)} · ATR({deps.settings.atr_period})"
+    markup = kb.chart_keyboard(deps.settings, name, interval)
+    file = BufferedInputFile(png, filename=f"{name}_{interval}.png")
     if query.message.photo:
-        await query.message.edit_media(media, reply_markup=kb)
+        await query.message.edit_media(InputMediaPhoto(media=file, caption=caption), reply_markup=markup)
     else:
-        await query.message.answer_photo(media.media, caption=media.caption, reply_markup=kb)
+        await query.message.answer_photo(file, caption=caption, reply_markup=markup)
 
 
 # ------------------------------------------------------------------ watchlist
 
-@router.message(Command("watch"))
-async def cmd_watch(message: Message, command: CommandObject, deps: Deps) -> None:
-    parts = (command.args or "").replace(",", " ").split()
-    if not parts:
-        await cmd_watchlist(message, deps)
+async def show_watchlist(message: Message, deps: Deps, uid: int, edit: bool = False) -> None:
+    symbols = deps.store.watchlist(uid)
+    if not symbols:
+        text, markup = format_watchlist([], {}, deps.settings.interval), kb.watchlist_keyboard([])
+        if edit:
+            await _safe_edit(message, text, markup)
+        else:
+            await message.answer(text, reply_markup=markup)
         return
-    uid = message.from_user.id
-    added, unknown = [], []
+    status = message if edit else await message.answer("⏳ Считаю…")
     try:
-        known = {i.symbol for i in await deps.scanner.exchange.list_symbols()}
+        metrics = await deps.scanner.metrics_for(symbols, deps.settings.interval)
     except ExchangeError as exc:
-        await message.answer(f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
+        await _safe_edit(status, f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
         return
-    for p in parts[:20]:
+    await _safe_edit(status, format_watchlist(symbols, metrics, deps.settings.interval), kb.watchlist_keyboard(symbols))
+
+
+async def _watch_add_many(bot: Bot, deps: Deps, uid: int, tokens: list[str]) -> str:
+    added, unknown = [], []
+    known = {i.symbol for i in await deps.scanner.exchange.list_symbols()}
+    for p in tokens[:20]:
         sym = deps.scanner.normalize_symbol(p)
         if sym not in known:
             unknown.append(sym)
@@ -412,7 +464,20 @@ async def cmd_watch(message: Message, command: CommandObject, deps: Deps) -> Non
         text += "❓ Не нашёл на бирже: " + ", ".join(unknown) + "\n"
     if not added and not unknown:
         text = "Уже в списке.\n"
-    text += f"В списке {len(deps.store.watchlist(uid))} монет. Показать: /watchlist"
+    return text + f"В списке {len(deps.store.watchlist(uid))} монет."
+
+
+@router.message(Command("watch"))
+async def cmd_watch(message: Message, command: CommandObject, deps: Deps) -> None:
+    parts = (command.args or "").replace(",", " ").split()
+    if not parts:
+        await show_watchlist(message, deps, message.from_user.id)
+        return
+    try:
+        text = await _watch_add_many(message.bot, deps, message.from_user.id, parts)
+    except ExchangeError as exc:
+        await message.answer(f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
+        return
     await message.answer(text)
 
 
@@ -433,25 +498,71 @@ async def cmd_unwatch(message: Message, command: CommandObject, deps: Deps) -> N
 
 
 @router.message(Command("watchlist"))
-async def cmd_watchlist(message: Message, deps: Deps) -> None:
-    uid = message.from_user.id
-    symbols = deps.store.watchlist(uid)
-    if not symbols:
-        await message.answer(format_watchlist([], {}, deps.settings.interval))
+@router.message(F.text == kb.BTN_WATCH)
+async def cmd_watchlist(message: Message, deps: Deps, state: FSMContext) -> None:
+    await state.clear()
+    await show_watchlist(message, deps, message.from_user.id)
+
+
+@router.callback_query(F.data.startswith("w:"))
+async def cb_watch(query: CallbackQuery, deps: Deps, state: FSMContext) -> None:
+    parts = query.data.split(":")
+    action = parts[1]
+    uid = query.from_user.id
+    if action == "ask":
+        await state.set_state(Ask.watch)
+        await query.answer()
+        await query.message.answer("Введите тикеры через пробел, например <code>SOL ETH DOGE</code>:", reply_markup=kb.cancel_menu())
         return
-    status = await message.answer("⏳ Считаю…")
+    if action == "refresh":
+        await query.answer("Обновляю…")
+        await show_watchlist(query.message, deps, uid, edit=True)
+        return
+    if action == "clear":
+        await deps.store.watch_remove(uid)
+        await query.answer("Список очищен")
+        await show_watchlist(query.message, deps, uid, edit=True)
+        return
+    if action == "add" and len(parts) >= 3:
+        sym = parts[2]
+        added = await deps.store.watch_add(uid, sym)
+        await query.answer(f"👀 Слежу за {sym}" if added else f"{sym} уже в списке")
+        if not query.message.photo:
+            await show_symbol(query.message, deps, uid, sym, edit=True)
+        return
+    if action == "rm" and len(parts) >= 3:
+        sym = parts[2]
+        origin = parts[3] if len(parts) > 3 else "list"
+        removed = await deps.store.watch_remove(uid, sym)
+        await query.answer(f"✖ Больше не слежу за {sym}" if removed else "Не было в списке")
+        if origin == "sym":
+            await show_symbol(query.message, deps, uid, sym, edit=True)
+        else:
+            await show_watchlist(query.message, deps, uid, edit=True)
+        return
+    await query.answer()
+
+
+@router.message(StateFilter(Ask.watch), F.text, ~F.text.in_(kb.MENU_BUTTONS))
+async def ask_watch_input(message: Message, deps: Deps, state: FSMContext) -> None:
+    await state.clear()
+    tokens = [t for t in message.text.replace(",", " ").split() if SYMBOL_RE.match(t)]
+    menu = kb.main_menu(deps.store.is_admin(message.from_user.id))
+    if not tokens:
+        await message.answer("Не увидел тикеров.", reply_markup=menu)
+        return
     try:
-        metrics = await deps.scanner.metrics_for(symbols, deps.settings.interval)
+        text = await _watch_add_many(message.bot, deps, message.from_user.id, tokens)
     except ExchangeError as exc:
-        await status.edit_text(f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
+        await message.answer(f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>", reply_markup=menu)
         return
-    await status.edit_text(format_watchlist(symbols, metrics, deps.settings.interval))
+    await message.answer(text, reply_markup=menu)
+    await show_watchlist(message, deps, message.from_user.id)
 
 
 # ------------------------------------------------------------------ subscriptions
 
 def _parse_sub_kind(args: str | None) -> str | None:
-    """None = default hourly; 'alerts'/'1d'/'1h' otherwise; '?' on garbage."""
     token = (args or "").strip().lower()
     if not token:
         return SUB_1H
@@ -467,9 +578,12 @@ def _parse_sub_kind(args: str | None) -> str | None:
 
 def _subs_text(store: Store, chat_id: int) -> str:
     kinds = store.chat_subs(chat_id)
-    if not kinds:
-        return "Подписок нет."
-    return "Подписки: " + ", ".join(SUB_TITLES[k] for k in SUB_KINDS if k in kinds)
+    body = "Подписок нет." if not kinds else "Подписки: " + ", ".join(SUB_TITLES[k] for k in SUB_KINDS if k in kinds)
+    return (
+        "🔔 <b>Рассылки в этот чат</b>\n" + body + "\n\n"
+        "<i>Часовой топ — после закрытия каждой часовой свечи · Дневной — после 00:00 UTC · "
+        "Алерты — монеты, у которых свеча вышла за старый ATR. Нажмите, чтобы включить или выключить.</i>"
+    )
 
 
 @router.message(Command("sub"))
@@ -480,7 +594,7 @@ async def cmd_sub(message: Message, command: CommandObject, deps: Deps) -> None:
         return
     added = await deps.store.subscribe(message.chat.id, kind)
     prefix = "✅ Подписал: " if added else "Уже подписаны: "
-    await message.answer(prefix + SUB_TITLES[kind] + ".\n" + _subs_text(deps.store, message.chat.id))
+    await message.answer(prefix + SUB_TITLES[kind] + ".\n\n" + _subs_text(deps.store, message.chat.id), reply_markup=kb.subs_keyboard(deps.store, message.chat.id))
 
 
 @router.message(Command("unsub"))
@@ -491,15 +605,31 @@ async def cmd_unsub(message: Message, command: CommandObject, deps: Deps) -> Non
         await message.answer("Использование: <code>/unsub</code> (все), <code>/unsub 1h</code>, <code>/unsub 1d</code>, <code>/unsub alerts</code>")
         return
     removed = await deps.store.unsubscribe(message.chat.id, kind)
-    if removed:
-        await message.answer("🔕 Отключил: " + ", ".join(SUB_TITLES[k] for k in SUB_KINDS if k in removed) + ".\n" + _subs_text(deps.store, message.chat.id))
-    else:
-        await message.answer("Такой подписки не было.\n" + _subs_text(deps.store, message.chat.id))
+    prefix = ("🔕 Отключил: " + ", ".join(SUB_TITLES[k] for k in SUB_KINDS if k in removed) + ".\n\n") if removed else "Такой подписки не было.\n\n"
+    await message.answer(prefix + _subs_text(deps.store, message.chat.id), reply_markup=kb.subs_keyboard(deps.store, message.chat.id))
 
 
 @router.message(Command("subs"))
-async def cmd_subs(message: Message, deps: Deps) -> None:
-    await message.answer(_subs_text(deps.store, message.chat.id))
+@router.message(F.text == kb.BTN_SUBS)
+async def cmd_subs(message: Message, deps: Deps, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(_subs_text(deps.store, message.chat.id), reply_markup=kb.subs_keyboard(deps.store, message.chat.id))
+
+
+@router.callback_query(F.data.startswith("sub:toggle:"))
+async def cb_sub_toggle(query: CallbackQuery, deps: Deps) -> None:
+    kind = query.data.split(":")[2]
+    if kind not in SUB_KINDS:
+        await query.answer()
+        return
+    chat_id = query.message.chat.id
+    if kind in deps.store.chat_subs(chat_id):
+        await deps.store.unsubscribe(chat_id, kind)
+        await query.answer(f"🔕 {SUB_TITLES[kind]}: выкл")
+    else:
+        await deps.store.subscribe(chat_id, kind)
+        await query.answer(f"✅ {SUB_TITLES[kind]}: вкл")
+    await _safe_edit(query.message, _subs_text(deps.store, chat_id), kb.subs_keyboard(deps.store, chat_id))
 
 
 # ------------------------------------------------------------------ admin
@@ -521,35 +651,20 @@ def _fmt_users(title: str, users: list[User]) -> str:
     return f"<b>{title}</b> ({len(users)}):\n" + "\n".join(f"  • {u.label()}" for u in users)
 
 
-@router.message(Command("admin"))
-async def cmd_admin(message: Message, deps: Deps) -> None:
-    if await _require_admin(message, deps):
-        await message.answer(ADMIN_HELP)
-
-
-@router.message(Command("users"))
-async def cmd_users(message: Message, deps: Deps) -> None:
-    if not await _require_admin(message, deps):
-        return
-    s = deps.store
-    text = "\n\n".join([
-        _fmt_users("👑 Владелец", s.by_role(ROLE_OWNER)),
-        _fmt_users("🛠 Админы", s.by_role(ROLE_ADMIN)),
-        _fmt_users("📈 Трейдеры", s.by_role(ROLE_TRADER)),
-        "🔔 Подписки: " + ", ".join(f"{SUB_TITLES[k]} — {len(s.subscribed(k))}" for k in SUB_KINDS),
-        f"👀 Монет в вотчлистах: {len(s.all_watched())}",
+def _users_text(store: Store) -> str:
+    return "\n\n".join([
+        _fmt_users("👑 Владелец", store.by_role(ROLE_OWNER)),
+        _fmt_users("🛠 Админы", store.by_role(ROLE_ADMIN)),
+        _fmt_users("📈 Трейдеры", store.by_role(ROLE_TRADER)),
+        "🔔 Подписки: " + ", ".join(f"{SUB_TITLES[k]} — {len(store.subscribed(k))}" for k in SUB_KINDS),
+        f"👀 Монет в вотчлистах: {len(store.all_watched())}",
     ])
-    await message.answer(text)
 
 
-@router.message(Command("requests"))
-async def cmd_requests(message: Message, deps: Deps) -> None:
-    if not await _require_admin(message, deps):
-        return
-    pending = deps.store.pending()[:30]
+def _requests_text(store: Store) -> str:
+    pending = store.pending()[:30]
     if not pending:
-        await message.answer("Заявок нет: все, кто писал боту, уже имеют роль.")
-        return
+        return "📨 Заявок нет: все, кто писал боту, уже имеют роль."
     lines = []
     for uid, info in pending:
         who = f"<code>{uid}</code>"
@@ -558,7 +673,44 @@ async def cmd_requests(message: Message, deps: Deps) -> None:
         if info.get("name"):
             who += f" · {html.escape(info['name'])}"
         lines.append(f"  • {who}")
-    await message.answer("<b>Писали боту без доступа</b>:\n" + "\n".join(lines) + "\n\nВыдать доступ: <code>/add_trader ID</code>")
+    return "📨 <b>Писали боту без доступа</b>:\n" + "\n".join(lines) + "\n\nОдобрить — кнопкой ниже или <code>/add_trader ID</code>"
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message, deps: Deps) -> None:
+    if await _require_admin(message, deps):
+        await message.answer(ADMIN_HELP)
+
+
+@router.message(Command("users"))
+@router.message(F.text == kb.BTN_USERS)
+async def cmd_users(message: Message, deps: Deps, state: FSMContext) -> None:
+    await state.clear()
+    if not await _require_admin(message, deps):
+        return
+    await message.answer(_users_text(deps.store), reply_markup=kb.users_keyboard(deps.store, deps.store.is_owner(message.from_user.id)))
+
+
+@router.message(Command("requests"))
+@router.message(F.text == kb.BTN_REQUESTS)
+async def cmd_requests(message: Message, deps: Deps, state: FSMContext) -> None:
+    await state.clear()
+    if not await _require_admin(message, deps):
+        return
+    await message.answer(_requests_text(deps.store), reply_markup=kb.requests_keyboard(deps.store, deps.store.is_owner(message.from_user.id)))
+
+
+@router.callback_query(F.data.in_({"menu:users", "menu:requests"}))
+async def cb_admin_menu(query: CallbackQuery, deps: Deps) -> None:
+    if not deps.store.is_admin(query.from_user.id):
+        await query.answer("⛔ Только для админов", show_alert=True)
+        return
+    await query.answer()
+    is_owner = deps.store.is_owner(query.from_user.id)
+    if query.data == "menu:users":
+        await _safe_edit(query.message, _users_text(deps.store), kb.users_keyboard(deps.store, is_owner))
+    else:
+        await _safe_edit(query.message, _requests_text(deps.store), kb.requests_keyboard(deps.store, is_owner))
 
 
 async def _set_menu(bot: Bot, user_id: int, commands: list[BotCommand]) -> None:
@@ -568,15 +720,70 @@ async def _set_menu(bot: Bot, user_id: int, commands: list[BotCommand]) -> None:
         pass  # private chat with the user does not exist yet
 
 
-async def _notify(bot: Bot, user_id: int, text: str) -> None:
+async def _notify(bot: Bot, user_id: int, text: str, reply_markup: Any = None) -> None:
     try:
-        await bot.send_message(user_id, text)
+        await bot.send_message(user_id, text, reply_markup=reply_markup)
     except (TelegramForbiddenError, TelegramBadRequest):
         pass  # user never started the bot or blocked it
 
 
-async def _change_role(message: Message, command: CommandObject, deps: Deps, role: str | None, owner_only: bool) -> None:
-    """role=None removes the user."""
+async def apply_role(bot: Bot, deps: Deps, actor: int, target: int, action: str) -> str:
+    """Shared by text commands and buttons. action: trader | admin | remove | deny. Returns a status line."""
+    store = deps.store
+    current = store.role(target)
+    if current == ROLE_OWNER:
+        return "Роль владельца изменить нельзя."
+    is_owner = store.is_owner(actor)
+    if action == "deny":
+        return "Заявка отклонена (пользователь остаётся без доступа)."
+    if action == "remove":
+        if current is None:
+            return "У этого пользователя и так нет доступа."
+        if current == ROLE_ADMIN and not is_owner:
+            return "⛔ Снять админа может только владелец."
+        removed = await store.remove_user(target)
+        await _set_menu(bot, target, USER_COMMANDS)
+        await _notify(bot, target, "⛔ Ваш доступ к боту отозван.", ReplyKeyboardRemove())
+        return f"🗑 Доступ отозван: {removed.label()}"
+    role = ROLE_ADMIN if action == "admin" else ROLE_TRADER
+    if role == ROLE_ADMIN and not is_owner:
+        return "⛔ Назначать админов может только владелец."
+    if current == ROLE_ADMIN and role == ROLE_TRADER and not is_owner:
+        return "⛔ Понизить админа может только владелец."
+    if current == role:
+        return f"Пользователь уже {ROLE_TITLES[role]}."
+    user = await store.set_role(target, role, added_by=actor)
+    await _set_menu(bot, target, ADMIN_COMMANDS if role == ROLE_ADMIN else USER_COMMANDS)
+    await _notify(
+        bot, target,
+        f"✅ Вам выдан доступ к боту, роль: <b>{ROLE_TITLES[role]}</b>. Справка — /help",
+        kb.main_menu(role == ROLE_ADMIN),
+    )
+    return f"✅ {user.label()} — теперь <b>{ROLE_TITLES[role]}</b>."
+
+
+@router.callback_query(F.data.startswith("u:"))
+async def cb_user_action(query: CallbackQuery, deps: Deps) -> None:
+    if not deps.store.is_admin(query.from_user.id):
+        await query.answer("⛔ Только для админов", show_alert=True)
+        return
+    _, uid_s, action = query.data.split(":")
+    if not uid_s.lstrip("-").isdigit() or action not in ("trader", "admin", "remove", "deny"):
+        await query.answer()
+        return
+    result = await apply_role(query.bot, deps, query.from_user.id, int(uid_s), action)
+    await query.answer(re.sub(r"<[^>]+>", "", result)[:180])
+    is_owner = deps.store.is_owner(query.from_user.id)
+    text = query.message.text or ""
+    if text.startswith("📨 Заявка на доступ"):
+        await _safe_edit(query.message, query.message.html_text + "\n\n" + result)
+    elif text.startswith("📨"):
+        await _safe_edit(query.message, _requests_text(deps.store), kb.requests_keyboard(deps.store, is_owner))
+    else:
+        await _safe_edit(query.message, _users_text(deps.store), kb.users_keyboard(deps.store, is_owner))
+
+
+async def _change_role(message: Message, command: CommandObject, deps: Deps, action: str, owner_only: bool) -> None:
     if not await _require_admin(message, deps, owner_only=owner_only):
         return
     ref = (command.args or "").strip().split()
@@ -590,57 +797,53 @@ async def _change_role(message: Message, command: CommandObject, deps: Deps, rol
             "Он должен сначала написать боту /start, либо укажите числовой ID (команда /myid)."
         )
         return
-    actor = message.from_user.id
-    current = deps.store.role(target)
-    if current == ROLE_OWNER:
-        await message.answer("Роль владельца изменить нельзя.")
-        return
-    if role is None:
-        if current is None:
-            await message.answer("У этого пользователя и так нет доступа.")
-            return
-        if current == ROLE_ADMIN and not deps.store.is_owner(actor):
-            await message.answer("⛔ Снять админа может только владелец.")
-            return
-        removed = await deps.store.remove_user(target)
-        await message.answer(f"🗑 Доступ отозван: {removed.label()}")
-        await _notify(message.bot, target, "⛔ Ваш доступ к боту отозван.")
-        return
-    if current == ROLE_ADMIN and role == ROLE_TRADER and not deps.store.is_owner(actor):
-        await message.answer("⛔ Понизить админа может только владелец.")
-        return
-    if current == role:
-        await message.answer(f"Пользователь уже {ROLE_TITLES[role]}.")
-        return
-    user = await deps.store.set_role(target, role, added_by=actor)
-    await _set_menu(message.bot, target, ADMIN_COMMANDS if role == ROLE_ADMIN else USER_COMMANDS)
-    await message.answer(f"✅ {user.label()} — теперь <b>{ROLE_TITLES[role]}</b>.")
-    await _notify(message.bot, target, f"✅ Вам выдан доступ к боту, роль: <b>{ROLE_TITLES[role]}</b>. Справка — /help")
+    await message.answer(await apply_role(message.bot, deps, message.from_user.id, target, action))
 
 
 @router.message(Command("add_trader"))
 async def cmd_add_trader(message: Message, command: CommandObject, deps: Deps) -> None:
-    await _change_role(message, command, deps, ROLE_TRADER, owner_only=False)
+    await _change_role(message, command, deps, "trader", owner_only=False)
 
 
 @router.message(Command("del_trader"))
 async def cmd_del_trader(message: Message, command: CommandObject, deps: Deps) -> None:
-    await _change_role(message, command, deps, None, owner_only=False)
+    await _change_role(message, command, deps, "remove", owner_only=False)
 
 
 @router.message(Command("add_admin"))
 async def cmd_add_admin(message: Message, command: CommandObject, deps: Deps) -> None:
-    await _change_role(message, command, deps, ROLE_ADMIN, owner_only=True)
+    await _change_role(message, command, deps, "admin", owner_only=True)
 
 
 @router.message(Command("del_admin"))
 async def cmd_del_admin(message: Message, command: CommandObject, deps: Deps) -> None:
-    await _change_role(message, command, deps, None, owner_only=True)
+    await _change_role(message, command, deps, "remove", owner_only=True)
 
 
 @router.message(Command("settings"))
-async def cmd_settings(message: Message, deps: Deps) -> None:
-    await message.answer(format_settings(deps.settings))
+@router.message(F.text == kb.BTN_SETTINGS)
+async def cmd_settings(message: Message, deps: Deps, state: FSMContext) -> None:
+    await state.clear()
+    is_admin = deps.store.is_admin(message.from_user.id)
+    await message.answer(format_settings(deps.settings), reply_markup=kb.settings_keyboard(deps.settings) if is_admin else None)
+
+
+@router.callback_query(F.data.startswith("set:"))
+async def cb_set(query: CallbackQuery, deps: Deps) -> None:
+    if not deps.store.is_admin(query.from_user.id):
+        await query.answer("⛔ Только для админов", show_alert=True)
+        return
+    _, attr, value_s = query.data.split(":")
+    if attr not in kb.SETTING_CHOICES:
+        await query.answer()
+        return
+    value = float(value_s)
+    if attr in ("top_n", "atr_period"):
+        value = int(value)
+    setattr(deps.settings, attr, value)
+    deps.scanner.invalidate()
+    await query.answer(f"{kb.SETTING_CHOICES[attr][0]} = {value:g}")
+    await _safe_edit(query.message, format_settings(deps.settings), kb.settings_keyboard(deps.settings))
 
 
 @router.message(Command("set"))
@@ -657,13 +860,10 @@ async def cmd_set(message: Message, command: CommandObject, deps: Deps) -> None:
             return
         deps.settings.lookbacks[tf] = int(parts[2])
         deps.scanner.invalidate()
-        await message.answer(f"✅ Окно сравнения для {tf_name(tf)} = {parts[2]} свечей\n\n" + format_settings(deps.settings))
+        await message.answer(f"✅ Окно сравнения для {tf_name(tf)} = {parts[2]} свечей\n\n" + format_settings(deps.settings), reply_markup=kb.settings_keyboard(deps.settings))
         return
     if len(parts) != 2 or parts[0].lower() not in _SET_PARAMS:
-        await message.answer(
-            "Использование: <code>/set параметр значение</code>\n"
-            "Параметры: " + ", ".join(sorted(set(_SET_PARAMS) | set(_LOOKBACK_KEYS)))
-        )
+        await message.answer("Использование: <code>/set параметр значение</code>\nПараметры: " + ", ".join(sorted(set(_SET_PARAMS) | set(_LOOKBACK_KEYS))))
         return
     attr, typ, (lo, hi) = _SET_PARAMS[parts[0].lower()]
     try:
@@ -676,13 +876,19 @@ async def cmd_set(message: Message, command: CommandObject, deps: Deps) -> None:
         return
     setattr(deps.settings, attr, value)
     deps.scanner.invalidate()
-    await message.answer(f"✅ <code>{attr}</code> = <code>{value:g}</code>\n\n" + format_settings(deps.settings))
+    await message.answer(f"✅ <code>{attr}</code> = <code>{value:g}</code>\n\n" + format_settings(deps.settings), reply_markup=kb.settings_keyboard(deps.settings))
 
+
+# ------------------------------------------------------------------ plain text: ticker or unknown
 
 @router.message(F.text)
-async def fallback(message: Message) -> None:
+async def fallback(message: Message, deps: Deps) -> None:
+    text = message.text.strip()
+    if message.chat.type == "private" and SYMBOL_RE.match(text):
+        await show_symbol(message, deps, message.from_user.id, text)
+        return
     if message.chat.type == "private":
-        await message.answer("Не понял команду. Справка — /help")
+        await message.answer("Не понял. Напишите тикер (например <code>SOL</code>) или выберите раздел в меню.", reply_markup=kb.main_menu(deps.store.is_admin(message.from_user.id)))
 
 
 # ------------------------------------------------------------------ alerts & schedulers
@@ -704,10 +910,7 @@ async def _breakout_alerts(bot: Bot, deps: Deps, result: ScanResult) -> None:
     if not chats:
         return
     s = deps.settings
-    hits = [
-        m for m in result.ranked
-        if m.last_tr_ratio >= s.alert_tr_ratio and m.last_tr_pct >= s.alert_min_tr_pct
-    ]
+    hits = [m for m in result.ranked if m.last_tr_ratio >= s.alert_tr_ratio and m.last_tr_pct >= s.alert_min_tr_pct]
     if not hits:
         return
     hits.sort(key=lambda m: m.last_tr_ratio, reverse=True)
@@ -720,6 +923,7 @@ async def _watch_alerts(bot: Bot, deps: Deps, interval: str) -> None:
     if not watched:
         return
     metrics = await deps.scanner.metrics_for(watched, interval)
+    step = interval_ms(interval)
     for uid, symbols in list(deps.store.watch.items()):
         for sym in symbols:
             m = metrics.get(sym)
@@ -730,16 +934,11 @@ async def _watch_alerts(bot: Bot, deps: Deps, interval: str) -> None:
             if m.last_tr_ratio >= s.watch_tr_ratio and deps.alerted.get(key_tr) != m.candle_time:
                 reasons.append(f"свеча {m.last_tr_pct:.1f}% — это {m.last_tr_ratio:.1f}× ATR (порог {s.watch_tr_ratio:g}×)")
                 deps.alerted[key_tr] = m.candle_time
-            step = interval_ms(interval)
-            last_exp = deps.alerted.get(key_exp, 0)
-            if m.expansion_pct >= s.watch_expansion_pct and m.candle_time - last_exp >= 6 * step:
+            if m.expansion_pct >= s.watch_expansion_pct and m.candle_time - deps.alerted.get(key_exp, 0) >= 6 * step:
                 reasons.append(f"ATR вырос на {m.expansion_pct:+.0f}% за {s.lookback_for(interval)} свечей (порог {s.watch_expansion_pct:g}%)")
                 deps.alerted[key_exp] = m.candle_time
             if reasons:
-                try:
-                    await bot.send_message(uid, format_watch_alert(m, interval, reasons))
-                except (TelegramForbiddenError, TelegramBadRequest) as exc:
-                    log.warning("watch alert to %s failed: %s", uid, exc)
+                await _notify(bot, uid, format_watch_alert(m, interval, reasons), kb.symbol_keyboard(s, sym, True))
                 await asyncio.sleep(0.05)
 
 
@@ -753,7 +952,7 @@ async def _after_close(bot: Bot, deps: Deps, interval: str, sub_kind: str) -> No
     chats = deps.store.subscribed(sub_kind)
     if chats:
         text = _top_text(deps, result, deps.settings.top_n, "atr", "all")
-        await _broadcast(bot, deps, chats, text, reply_markup=_top_keyboard(deps.settings, "atr", interval, deps.settings.top_n, "all"))
+        await _broadcast(bot, deps, chats, text, reply_markup=kb.top_keyboard(deps.settings, "atr", interval, deps.settings.top_n, "all"))
     if interval == "1h":
         await _breakout_alerts(bot, deps, result)
     try:
@@ -776,6 +975,7 @@ async def candle_scheduler(bot: Bot, deps: Deps, interval: str, sub_kind: str) -
 
 
 USER_COMMANDS = [
+    BotCommand(command="menu", description="Меню"),
     BotCommand(command="top", description="Топ по ATR%: /top, /top 4h, /top 1d long"),
     BotCommand(command="exp", description="Топ по росту ATR: /exp [тф] [N]"),
     BotCommand(command="atr", description="Монета на всех таймфреймах: /atr BTC"),
@@ -783,17 +983,13 @@ USER_COMMANDS = [
     BotCommand(command="watch", description="Следить за монетой: /watch SOL"),
     BotCommand(command="watchlist", description="Мои монеты"),
     BotCommand(command="unwatch", description="Перестать следить: /unwatch SOL"),
-    BotCommand(command="sub", description="Рассылка: /sub, /sub 1d, /sub alerts"),
-    BotCommand(command="unsub", description="Отключить рассылку"),
+    BotCommand(command="subs", description="Рассылки в этот чат"),
     BotCommand(command="myid", description="Мой Telegram ID и роль"),
     BotCommand(command="help", description="Справка"),
 ]
 ADMIN_COMMANDS = USER_COMMANDS + [
-    BotCommand(command="admin", description="Админка"),
     BotCommand(command="users", description="Пользователи и роли"),
-    BotCommand(command="requests", description="Кто просит доступ"),
-    BotCommand(command="add_trader", description="Дать доступ трейдеру"),
-    BotCommand(command="del_trader", description="Забрать доступ"),
+    BotCommand(command="requests", description="Заявки на доступ"),
     BotCommand(command="settings", description="Параметры сканера"),
 ]
 
