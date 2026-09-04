@@ -272,6 +272,7 @@ def format_top(
     min_cap: float = 0.0,
     corr: str = "any",
 ) -> str:
+    tf = result.interval
     rows = result.top(n, by, direction, min_volume, min_cap, corr)
     head = _top_header(result, by, direction, min_volume, min_cap, corr)
     if not rows:

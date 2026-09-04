@@ -12,7 +12,7 @@ from typing import Sequence
 import aiohttp
 
 from .config import Settings
-from .exchanges import BaseExchange, Deriv, ExchangeError, SymbolInfo, make_exchange
+from .exchanges import BaseExchange, Deriv, ExchangeError, SymbolInfo, interval_ms, make_exchange
 from .indicators import AtrMetrics, Candle, candle_returns, compute_metrics
 from .marketcap import MarketCapProvider
 
@@ -77,19 +77,20 @@ class ScanResult:
     def candle_time(self) -> int:
         return self.ranked[0].candle_time if self.ranked else 0
 
+    _index: dict[str, int] = field(default_factory=dict, repr=False)
+
+    def _idx(self) -> dict[str, int]:
+        if len(self._index) != len(self.ranked):
+            self._index = {m.symbol: i for i, m in enumerate(self.ranked)}
+        return self._index
+
     def find(self, symbol: str) -> AtrMetrics | None:
-        symbol = symbol.upper()
-        for m in self.ranked:
-            if m.symbol == symbol:
-                return m
-        return None
+        i = self._idx().get(symbol.upper())
+        return self.ranked[i] if i is not None else None
 
     def rank_of(self, symbol: str) -> int | None:
-        symbol = symbol.upper()
-        for i, m in enumerate(self.ranked, start=1):
-            if m.symbol == symbol:
-                return i
-        return None
+        i = self._idx().get(symbol.upper())
+        return i + 1 if i is not None else None
 
 
 class Scanner:
@@ -103,6 +104,9 @@ class Scanner:
         self._symbols_cache: tuple[float, list[SymbolInfo]] | None = None
         self._btc_cache: dict[str, tuple[float, dict[int, float]]] = {}  # interval -> (time, returns)
         self._deriv_cache: tuple[float, dict[str, Deriv]] | None = None
+        self._all_symbols_cache: tuple[float, list[SymbolInfo]] | None = None
+        self._bg: set[asyncio.Task] = set()
+        self._deriv_task: asyncio.Task | None = None
         # Hourly open-interest snapshots [{"t": ms, "oi": {symbol: usd}}], shared with the store for persistence.
         self.oi_history: list[dict] = []
 
@@ -121,7 +125,37 @@ class Scanner:
             )
             self._mcap = MarketCapProvider(self._session, ttl=self.settings.mcap_ttl, proxy=self.settings.exchange_proxy)
 
+    def _spawn(self, coro) -> asyncio.Task:  # noqa: ANN001
+        """Run a coroutine in the background, keeping a reference so it is not garbage-collected."""
+        task = asyncio.create_task(coro)
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+        return task
+
+    async def warm_up(self) -> None:
+        """Pre-fetch everything so that the first user request is served from cache."""
+        started = time.time()
+        try:
+            await self.mcap.get()
+            await self.derivatives(force=True)
+            for tf in self.settings.intervals:
+                await self.scan(tf)
+        except Exception:  # noqa: BLE001
+            log.exception("warm-up failed")
+        log.info("warm-up done in %.1fs", time.time() - started)
+
+    async def refresh_stale(self) -> None:
+        """Rescan every interval whose last closed candle has changed (called after each hourly close)."""
+        for tf in self.settings.intervals:
+            if not self.is_fresh(tf):
+                try:
+                    await self.scan(tf)
+                except ExchangeError:
+                    log.exception("refresh %s failed", tf)
+
     async def close(self) -> None:
+        for t in self._bg:
+            t.cancel()
         if self._session is not None:
             await self._session.close()
             self._session = None
@@ -152,12 +186,25 @@ class Scanner:
         self._symbols_cache = None
         self._btc_cache = {}
 
+    async def all_symbols(self) -> list[SymbolInfo]:
+        """Every tradable symbol on the exchange (two HTTP calls), cached for 10 minutes."""
+        now = time.time()
+        if self._all_symbols_cache and now - self._all_symbols_cache[0] < 600:
+            return self._all_symbols_cache[1]
+        symbols = await self.exchange.list_symbols()
+        self._all_symbols_cache = (now, symbols)
+        return symbols
+
+    async def symbol_info(self, symbol: str) -> SymbolInfo | None:
+        symbol = self.normalize_symbol(symbol)
+        return next((i for i in await self.all_symbols() if i.symbol == symbol), None)
+
     async def symbols(self) -> list[SymbolInfo]:
         """Tradable symbols filtered by quote volume, cached for 10 minutes."""
         now = time.time()
         if self._symbols_cache and now - self._symbols_cache[0] < 600:
             return self._symbols_cache[1]
-        all_symbols = await self.exchange.list_symbols()
+        all_symbols = await self.all_symbols()
         quote = self.settings.quote_asset
         symbols = [
             s for s in all_symbols
@@ -170,16 +217,32 @@ class Scanner:
         return symbols
 
     async def derivatives(self, force: bool = False) -> dict[str, Deriv]:
-        """Funding + open interest for all scanned symbols, cached for 10 minutes."""
-        if not force and self._deriv_cache and time.time() - self._deriv_cache[0] < 600:
+        """Funding + open interest for all scanned symbols, cached for 10 minutes.
+
+        Without `force` a stale cache is returned immediately and refreshed in the background,
+        so user requests never wait for hundreds of open-interest calls.
+        """
+        fresh = self._deriv_cache is not None and time.time() - self._deriv_cache[0] < 600
+        if fresh and not force:
             return self._deriv_cache[1]
+        if self._deriv_cache is not None and not force:
+            if self._deriv_task is None or self._deriv_task.done():
+                self._deriv_task = self._spawn(self._fetch_derivatives())
+            return self._deriv_cache[1]
+        if self._deriv_task is not None and not self._deriv_task.done():
+            await self._deriv_task
+            return self._deriv_cache[1] if self._deriv_cache else {}
+        self._deriv_task = self._spawn(self._fetch_derivatives())
+        await self._deriv_task
+        return self._deriv_cache[1] if self._deriv_cache else {}
+
+    async def _fetch_derivatives(self) -> None:
         try:
             data = await self.exchange.fetch_derivatives(await self.symbols(), self.settings.concurrency)
         except ExchangeError as exc:
             log.warning("derivatives fetch failed: %s", exc)
             data = self._deriv_cache[1] if self._deriv_cache else {}
         self._deriv_cache = (time.time(), data)
-        return data
 
     def record_oi(self, candle_time: int, derivs: dict[str, Deriv]) -> None:
         """Store an hourly OI snapshot (idempotent per candle)."""
@@ -220,8 +283,7 @@ class Scanner:
         cached = self._btc_cache.get(interval)
         if cached and time.time() - cached[0] < self.settings.cache_ttl:
             return cached[1]
-        symbol = "BTC" + self.settings.quote_asset
-        info = next((i for i in await self.exchange.list_symbols() if i.symbol == symbol), None)
+        info = await self.symbol_info("BTC" + self.settings.quote_asset)
         if info is None:
             return {}
         try:
@@ -233,14 +295,23 @@ class Scanner:
         self._btc_cache[interval] = (time.time(), returns)
         return returns
 
+    def is_fresh(self, interval: str) -> bool:
+        """A cached scan stays valid until the next candle of that interval closes:
+        only closed candles are used, so nothing changes in between."""
+        cached = self._last.get(interval)
+        if cached is None or not cached.ranked:
+            return False
+        step = interval_ms(interval)
+        next_close = (cached.candle_time + 2 * step) / 1000 + self.settings.close_delay
+        return time.time() < next_close and time.time() - cached.scanned_at < 6 * 3600
+
     async def scan(self, interval: str | None = None, force: bool = False) -> ScanResult:
-        """Run a full scan for the interval, or return a fresh-enough cached result."""
+        """Run a full scan for the interval, or return the cached result while it is still valid."""
         interval = interval or self.settings.interval
         lock = self._locks.setdefault(interval, asyncio.Lock())
         async with lock:
-            cached = self._last.get(interval)
-            if not force and cached is not None and time.time() - cached.scanned_at < self.settings.cache_ttl:
-                return cached
+            if not force and self.is_fresh(interval):
+                return self._last[interval]
             result = await self._scan(interval)
             self._last[interval] = result
             return result
@@ -249,7 +320,10 @@ class Scanner:
         s = self.settings
         started = time.time()
         symbols = await self.symbols()
-        await self.mcap.get()  # warm the market cap cache (failures are logged, not fatal)
+        if self.mcap.loaded:
+            self._spawn(self.mcap.get())  # refresh in background when stale; never block a scan on it
+        else:
+            await self.mcap.get()
         btc, derivs = await asyncio.gather(self.btc_returns(interval), self.derivatives())
         sem = asyncio.Semaphore(s.concurrency)
         limit = s.candles_needed(interval)
@@ -299,14 +373,18 @@ class Scanner:
         """
         symbol = self.normalize_symbol(symbol)
         intervals = list(intervals or self.settings.intervals)
-        all_symbols = await self.exchange.list_symbols()
-        info = next((i for i in all_symbols if i.symbol == symbol), None)
+        info = await self.symbol_info(symbol)
         if info is None:
             return None
 
         cap = await self._cap(info.symbol)
 
         async def one(interval: str) -> AtrMetrics | None:
+            cached = self._last.get(interval)
+            if cached is not None and self.is_fresh(interval):
+                m = cached.find(symbol)
+                if m is not None:
+                    return m
             candles, btc = await asyncio.gather(
                 self.exchange.fetch_candles(info, interval, self.settings.candles_needed(interval)),
                 self.btc_returns(interval),
@@ -319,7 +397,7 @@ class Scanner:
 
     async def metrics_for(self, symbols: Sequence[str], interval: str) -> dict[str, AtrMetrics | None]:
         """Metrics for a list of symbols on one interval; uses the cached scan when it has them."""
-        cached = self._last.get(interval)
+        cached = self._last.get(interval) if self.is_fresh(interval) else None
         out: dict[str, AtrMetrics | None] = {}
         missing: list[str] = []
         for sym in symbols:
@@ -329,8 +407,7 @@ class Scanner:
             else:
                 missing.append(sym)
         if missing:
-            all_symbols = await self.exchange.list_symbols()
-            by_name = {i.symbol: i for i in all_symbols}
+            by_name = {i.symbol: i for i in await self.all_symbols()}
             btc = await self.btc_returns(interval)
             sem = asyncio.Semaphore(self.settings.concurrency)
 
@@ -353,9 +430,7 @@ class Scanner:
 
     async def candles(self, symbol: str, interval: str, limit: int) -> list[Candle] | None:
         """Raw closed candles for charts. None if the symbol is unknown."""
-        symbol = self.normalize_symbol(symbol)
-        all_symbols = await self.exchange.list_symbols()
-        info = next((i for i in all_symbols if i.symbol == symbol), None)
+        info = await self.symbol_info(symbol)
         if info is None:
             return None
         return await self.exchange.fetch_candles(info, interval, limit)

@@ -321,14 +321,19 @@ def _top_kb(deps: Deps, q: TopQuery):
 
 
 async def show_top(message: Message, deps: Deps, q: TopQuery, edit: bool = False, force: bool = False) -> None:
-    status = message if edit else await message.answer(f"⏳ Сканирую рынок · {tf_name(q.interval)}…")
+    cached = deps.scanner.is_fresh(q.interval) and not force
+    status = message if (edit or cached) else await message.answer(f"⏳ Сканирую рынок · {tf_name(q.interval)}…")
     try:
         result = await _scan_and_record(deps, q.interval, force=force)
     except ExchangeError as exc:
         log.exception("scan failed")
         await _safe_edit(status, f"😕 Биржа не ответила: <code>{html.escape(str(exc)[:200])}</code>\nПопробуйте ещё раз через минуту.")
         return
-    await _safe_edit(status, _top_text(deps, result, q), _top_kb(deps, q))
+    text, markup = _top_text(deps, result, q), _top_kb(deps, q)
+    if edit or not cached:
+        await _safe_edit(status, text, markup)
+    else:
+        await message.answer(text, reply_markup=markup)
 
 
 async def _send_top(message: Message, command: CommandObject, deps: Deps, by: str) -> None:
@@ -378,7 +383,12 @@ async def cb_top(query: CallbackQuery, deps: Deps) -> None:
         await query.answer()
         return
     refresh = len(parts) > 9 and parts[9] == "r"
-    await query.answer("Обновляю…" if refresh else None)
+    if refresh:
+        await query.answer("Обновляю…")
+    elif not deps.scanner.is_fresh(q.interval):
+        await query.answer(f"⏳ Сканирую {tf_name(q.interval)}…")
+    else:
+        await query.answer()
     await show_top(query.message, deps, q, edit=True, force=refresh)
 
 
@@ -440,12 +450,23 @@ async def cb_symbol(query: CallbackQuery, deps: Deps) -> None:
         await show_symbol(query.message, deps, query.from_user.id, symbol, edit=True)
 
 
+_chart_cache: dict[tuple[str, str], tuple[float, bytes]] = {}  # (symbol, interval) -> (expires_at, png)
+
+
 async def _chart_png(deps: Deps, symbol: str, interval: str) -> tuple[str, bytes] | None:
-    candles = await deps.scanner.candles(symbol, interval, deps.settings.chart_candles)
+    name = deps.scanner.normalize_symbol(symbol)
+    hit = _chart_cache.get((name, interval))
+    if hit and time.time() < hit[0]:
+        return name, hit[1]
+    candles = await deps.scanner.candles(name, interval, deps.settings.chart_candles)
     if candles is None:
         return None
-    name = deps.scanner.normalize_symbol(symbol)
     png = await asyncio.get_running_loop().run_in_executor(None, render_chart, name, interval, candles, deps.settings.atr_period)
+    step = interval_ms(interval) / 1000
+    expires = (time.time() // step + 1) * step + deps.settings.close_delay  # valid until the next candle closes
+    if len(_chart_cache) > 300:
+        _chart_cache.clear()
+    _chart_cache[(name, interval)] = (expires, png)
     return name, png
 
 
@@ -526,7 +547,7 @@ async def show_watchlist(message: Message, deps: Deps, uid: int, edit: bool = Fa
 
 async def _watch_add_many(bot: Bot, deps: Deps, uid: int, tokens: list[str]) -> str:
     added, unknown = [], []
-    known = {i.symbol for i in await deps.scanner.exchange.list_symbols()}
+    known = {i.symbol for i in await deps.scanner.all_symbols()}
     for p in tokens[:20]:
         sym = deps.scanner.normalize_symbol(p)
         if sym not in known:
@@ -1047,6 +1068,8 @@ async def _after_close(bot: Bot, deps: Deps, interval: str, sub_kind: str) -> No
         except Exception:  # noqa: BLE001
             log.exception("OI snapshot failed")
         await _breakout_alerts(bot, deps, result)
+        # 4h / 1d / 1w candles close on hour boundaries too: keep their caches warm for instant buttons
+        await deps.scanner.refresh_stale()
     try:
         await _watch_alerts(bot, deps, interval)
     except ExchangeError:
@@ -1120,6 +1143,7 @@ async def run_bot(settings: Settings) -> None:
         dp.include_router(router)
         dp["deps"] = deps
         tasks = [
+            asyncio.create_task(scanner.warm_up()),
             asyncio.create_task(candle_scheduler(bot, deps, "1h", SUB_1H)),
             asyncio.create_task(candle_scheduler(bot, deps, "1d", SUB_1D)),
             asyncio.create_task(prefs_scheduler(bot, deps)),

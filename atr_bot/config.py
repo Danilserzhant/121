@@ -62,7 +62,7 @@ class Settings:
     # Minimum ATR% (average hourly move) to be listed at all.
     min_atr_pct: float = field(default_factory=lambda: _env_float("MIN_ATR_PCT", 0.0))
     # Max parallel kline requests to the exchange.
-    concurrency: int = field(default_factory=lambda: _env_int("CONCURRENCY", 8))
+    concurrency: int = field(default_factory=lambda: _env_int("CONCURRENCY", 16))
     # Cache scan results for this many seconds (protects from /top spam).
     cache_ttl: int = field(default_factory=lambda: _env_int("CACHE_TTL", 60))
     # Seconds after the hourly candle close to wait before the auto scan.
