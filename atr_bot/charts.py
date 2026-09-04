@@ -14,11 +14,14 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from .indicators import Candle, atr_pct_series, true_ranges_pct  # noqa: E402
 
-UP, DOWN, ATR_COLOR, TR_COLOR = "#26a69a", "#ef5350", "#ff9800", "#90a4ae"
+UP, DOWN, ATR_COLOR, TR_COLOR, SPIKE_COLOR = "#26a69a", "#ef5350", "#ff9800", "#546e7a", "#ffca28"
 
 
-def render_chart(symbol: str, interval: str, candles: Sequence[Candle], period: int) -> bytes:
-    """Return PNG bytes: price candles on top, ATR% and per-candle TR% below."""
+def render_chart(symbol: str, interval: str, candles: Sequence[Candle], period: int, spike_ratio: float = 2.0) -> bytes:
+    """Return PNG bytes: price candles on top, ATR% and per-candle TR% below.
+
+    TR bars bigger than `spike_ratio` × previous ATR are highlighted as breakouts.
+    """
     if len(candles) < 2:
         raise ValueError("not enough candles")
     step_days = (candles[1].open_time - candles[0].open_time) / 86_400_000
@@ -46,10 +49,21 @@ def render_chart(symbol: str, interval: str, candles: Sequence[Candle], period: 
         ax1.bar(x, body_h or (c.high - c.low) * 0.002, bottom=body_low, width=width, color=color, align="center")
     last = candles[-1]
     ax1.axhline(last.close, color="#b2b5be", linewidth=0.6, linestyle="--")
-    ax1.set_title(f"{symbol}  ·  {interval}  ·  close {last.close:g}", color="#e0e3eb", fontsize=12, loc="left")
+    chg = (last.close / candles[-2].close - 1) * 100
+    ax1.set_title(f"{symbol}   {interval}   close {last.close:g}  ({chg:+.2f}%)", color="#e0e3eb", fontsize=12, loc="left", fontweight="bold")
+    hi, lo = max(c.high for c in candles), min(c.low for c in candles)
+    ax1.axhline(hi, color=UP, linewidth=0.5, linestyle=":", alpha=0.7)
+    ax1.axhline(lo, color=DOWN, linewidth=0.5, linestyle=":", alpha=0.7)
+    ax1.annotate(f"{hi:g}", xy=(xs[-1], hi), xytext=(4, 0), textcoords="offset points", color=UP, fontsize=8, va="center")
+    ax1.annotate(f"{lo:g}", xy=(xs[-1], lo), xytext=(4, 0), textcoords="offset points", color=DOWN, fontsize=8, va="center")
     ax1.set_ylabel("price", color="#b2b5be")
 
-    ax2.bar(xs, trs, width=width, color=TR_COLOR, alpha=0.55, label="TR % свечи")
+    colors = []
+    for i, tr in enumerate(trs):
+        prev_atr = atr[i - 1] if i > 0 else None
+        colors.append(SPIKE_COLOR if prev_atr and tr >= spike_ratio * prev_atr else TR_COLOR)
+    ax2.bar(xs, trs, width=width, color=colors, alpha=0.8, label="TR % свечи")
+    ax2.bar([], [], color=SPIKE_COLOR, label=f"свеча ≥ {spike_ratio:g}× ATR")
     ax2.plot(xs, [v if v is not None else float("nan") for v in atr], color=ATR_COLOR, linewidth=1.6, label=f"ATR({period}) %")
     ax2.set_ylabel("%", color="#b2b5be")
     ax2.legend(loc="upper left", fontsize=8, frameon=False, labelcolor="#e0e3eb")
@@ -64,6 +78,7 @@ def render_chart(symbol: str, interval: str, candles: Sequence[Candle], period: 
     ax1.set_xlim(xs[0] - (xs[1] - xs[0]), xs[-1] + (xs[1] - xs[0]) * 3)
 
     buf = io.BytesIO()
+    fig.text(0.99, 0.01, "ATR Bot", color="#4a4f5c", fontsize=8, ha="right", va="bottom")
     fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     return buf.getvalue()

@@ -13,6 +13,7 @@ import aiohttp
 from .config import Settings
 from .exchanges import BaseExchange, ExchangeError, SymbolInfo, make_exchange
 from .indicators import AtrMetrics, Candle, compute_metrics
+from .marketcap import MarketCapProvider
 
 log = logging.getLogger(__name__)
 
@@ -35,13 +36,22 @@ class ScanResult:
     errors: int = 0
     duration: float = 0.0
 
-    def top(self, n: int, by: str = "atr", direction: str = "all") -> list[AtrMetrics]:
-        """Top N by 'atr' (ATR% of price) or 'expansion' (ATR growth), optionally only long/short movers."""
+    def top(
+        self, n: int, by: str = "atr", direction: str = "all", min_volume: float = 0.0, min_cap: float = 0.0,
+    ) -> list[AtrMetrics]:
+        """Top N by 'atr' (ATR% of price) or 'expansion' (ATR growth) with optional filters.
+
+        min_volume: 24h quote volume floor; min_cap: market cap floor (coins with unknown cap are dropped).
+        """
         rows = self.ranked
         if direction == "long":
             rows = [m for m in rows if m.move_pct > 0]
         elif direction == "short":
             rows = [m for m in rows if m.move_pct < 0]
+        if min_volume > 0:
+            rows = [m for m in rows if m.quote_volume >= min_volume]
+        if min_cap > 0:
+            rows = [m for m in rows if m.market_cap >= min_cap]
         if by == "expansion":
             rows = sorted(rows, key=lambda m: m.expansion_pct, reverse=True)
         return rows[:n]
@@ -70,6 +80,7 @@ class Scanner:
         self.settings = settings
         self._session: aiohttp.ClientSession | None = None
         self._exchange: BaseExchange | None = None
+        self._mcap: MarketCapProvider | None = None
         self._locks: dict[str, asyncio.Lock] = {}
         self._last: dict[str, ScanResult] = {}
         self._symbols_cache: tuple[float, list[SymbolInfo]] | None = None
@@ -87,12 +98,23 @@ class Scanner:
             self._exchange = make_exchange(
                 self.settings.exchange, self._session, self.settings.quote_asset, self.settings.exchange_proxy
             )
+            self._mcap = MarketCapProvider(self._session, ttl=self.settings.mcap_ttl, proxy=self.settings.exchange_proxy)
 
     async def close(self) -> None:
         if self._session is not None:
             await self._session.close()
             self._session = None
             self._exchange = None
+
+    @property
+    def mcap(self) -> MarketCapProvider:
+        if self._mcap is None:
+            raise RuntimeError("Scanner is not opened")
+        return self._mcap
+
+    async def _cap(self, symbol: str) -> float:
+        await self.mcap.get()
+        return self.mcap.cap(symbol, self.settings.quote_asset)
 
     @property
     def exchange(self) -> BaseExchange:
@@ -141,6 +163,7 @@ class Scanner:
         s = self.settings
         started = time.time()
         symbols = await self.symbols()
+        await self.mcap.get()  # warm the market cap cache (failures are logged, not fatal)
         sem = asyncio.Semaphore(s.concurrency)
         limit = s.candles_needed(interval)
         lookback = s.lookback_for(interval)
@@ -155,7 +178,9 @@ class Scanner:
                     errors += 1
                     log.warning("%s: %s", info.symbol, exc)
                     return None
-            return compute_metrics(info.symbol, candles, s.atr_period, lookback, info.quote_volume)
+            return compute_metrics(
+                info.symbol, candles, s.atr_period, lookback, info.quote_volume, self.mcap.cap(info.symbol, s.quote_asset)
+            )
 
         metrics = await asyncio.gather(*(one(i) for i in symbols))
         ranked = [m for m in metrics if m is not None and m.atr_pct >= s.min_atr_pct]
@@ -192,9 +217,11 @@ class Scanner:
         if info is None:
             return None
 
+        cap = await self._cap(info.symbol)
+
         async def one(interval: str) -> AtrMetrics | None:
             candles = await self.exchange.fetch_candles(info, interval, self.settings.candles_needed(interval))
-            return compute_metrics(info.symbol, candles, self.settings.atr_period, self.settings.lookback_for(interval), info.quote_volume)
+            return compute_metrics(info.symbol, candles, self.settings.atr_period, self.settings.lookback_for(interval), info.quote_volume, cap)
 
         results = await asyncio.gather(*(one(tf) for tf in intervals))
         return dict(zip(intervals, results))
@@ -225,7 +252,7 @@ class Scanner:
                     except ExchangeError as exc:
                         log.warning("%s: %s", sym, exc)
                         return None
-                return compute_metrics(sym, candles, self.settings.atr_period, self.settings.lookback_for(interval), info.quote_volume)
+                return compute_metrics(sym, candles, self.settings.atr_period, self.settings.lookback_for(interval), info.quote_volume, await self._cap(sym))
 
             for sym, m in zip(missing, await asyncio.gather(*(one(s) for s in missing))):
                 out[sym] = m

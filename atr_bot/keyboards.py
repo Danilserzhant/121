@@ -42,9 +42,20 @@ def _mark(active: bool, text: str) -> str:
     return ("· " if active else "") + text
 
 
-def top_keyboard(settings: Settings, by: str, interval: str, n: int, direction: str) -> InlineKeyboardMarkup:
-    def cb(by_=by, tf=interval, n_=n, d=direction) -> str:
-        return f"top:{by_}:{tf}:{n_}:{d}"
+VOL_CHOICES = [0, 5e6, 20e6, 100e6]      # 24h quote volume floors
+CAP_CHOICES = [0, 50e6, 300e6, 1e9]      # market cap floors
+
+
+def _fmt_floor(v: float) -> str:
+    return "любой" if v <= 0 else ("≥" + (f"{v/1e9:g}B" if v >= 1e9 else f"{v/1e6:g}M"))
+
+
+def top_keyboard(
+    settings: Settings, by: str, interval: str, n: int, direction: str, view: str = "list",
+    min_volume: float = 0.0, min_cap: float = 0.0,
+) -> InlineKeyboardMarkup:
+    def cb(by_=by, tf=interval, n_=n, d=direction, v=view, vol=min_volume, cap=min_cap) -> str:
+        return f"top:{by_}:{tf}:{n_}:{d}:{v}:{int(vol/1e6)}:{int(cap/1e6)}"
 
     tf_row = [InlineKeyboardButton(text=_mark(tf == interval, tf_name(tf)), callback_data=cb(tf=tf)) for tf in settings.intervals]
     mode_row = [
@@ -58,9 +69,16 @@ def top_keyboard(settings: Settings, by: str, interval: str, n: int, direction: 
         InlineKeyboardButton(text=_mark(n == 10, "10"), callback_data=cb(n_=10)),
         InlineKeyboardButton(text=_mark(n == 20, "20"), callback_data=cb(n_=20)),
         InlineKeyboardButton(text=_mark(n == 30, "30"), callback_data=cb(n_=30)),
-        InlineKeyboardButton(text="🔄 Обновить", callback_data=cb() + ":r"),
+        InlineKeyboardButton(text="📋 Таблица" if view == "list" else "📱 Список", callback_data=cb(v="table" if view == "list" else "list")),
+        InlineKeyboardButton(text="🔄", callback_data=cb() + ":r"),
     ]
-    return InlineKeyboardMarkup(inline_keyboard=[tf_row, mode_row, action_row])
+    vol_row = [InlineKeyboardButton(text="об.24ч", callback_data="noop")] + [
+        InlineKeyboardButton(text=_mark(abs(min_volume - v) < 1, _fmt_floor(v)), callback_data=cb(vol=v)) for v in VOL_CHOICES
+    ]
+    cap_row = [InlineKeyboardButton(text="капа", callback_data="noop")] + [
+        InlineKeyboardButton(text=_mark(abs(min_cap - v) < 1, _fmt_floor(v)), callback_data=cb(cap=v)) for v in CAP_CHOICES
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[tf_row, mode_row, vol_row, cap_row, action_row])
 
 
 def chart_keyboard(settings: Settings, symbol: str, interval: str) -> InlineKeyboardMarkup:
@@ -184,3 +202,10 @@ def approve_keyboard(uid: int, actor_is_owner: bool) -> InlineKeyboardMarkup:
         row.append(InlineKeyboardButton(text="🛠 Админ", callback_data=f"u:{uid}:admin"))
     row.append(InlineKeyboardButton(text="🚫 Отказать", callback_data=f"u:{uid}:deny"))
     return InlineKeyboardMarkup(inline_keyboard=[row])
+
+
+def symbols_keyboard(symbols: list[str], per_row: int = 3) -> InlineKeyboardMarkup:
+    """Buttons opening coin cards (used under alerts)."""
+    buttons = [InlineKeyboardButton(text=f"🔎 {s.removesuffix('USDT')}", callback_data=f"sym:{s}") for s in symbols]
+    rows = [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)

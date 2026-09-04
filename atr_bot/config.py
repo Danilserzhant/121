@@ -76,6 +76,8 @@ class Settings:
     watch_expansion_pct: float = field(default_factory=lambda: _env_float("WATCH_EXPANSION_PCT", 50.0))
     # How many symbols per interval to remember for "how long in the top" streaks.
     history_top: int = field(default_factory=lambda: _env_int("HISTORY_TOP", 20))
+    # Market cap cache lifetime, seconds (CoinPaprika / CoinGecko).
+    mcap_ttl: int = field(default_factory=lambda: _env_int("MCAP_TTL", 1800))
     # Chart: number of candles to draw.
     chart_candles: int = field(default_factory=lambda: _env_int("CHART_CANDLES", 120))
     # Telegram user id of the bot owner. If empty, the first person who sends

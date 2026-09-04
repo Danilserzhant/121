@@ -26,8 +26,8 @@ from .charts import render_chart
 from .config import Settings
 from .exchanges import ExchangeError, interval_ms
 from .formatting import (
-    DIRECTION_TITLES, HELP, format_breakouts, format_settings, format_symbol, format_top, format_watch_alert,
-    format_watchlist, parse_direction, parse_timeframe, tf_name,
+    DIRECTION_TITLES, HELP, VIEWS, format_breakouts, format_settings, format_symbol, format_top, format_watch_alert,
+    format_watchlist, parse_amount, parse_direction, parse_filter, parse_timeframe, tf_name, welcome,
 )
 from .scanner import ScanResult, Scanner
 from .storage import (
@@ -170,9 +170,12 @@ async def cmd_start(message: Message, deps: Deps, state: FSMContext) -> None:
         )
         return
     is_admin = deps.store.is_admin(uid)
+    menu = kb.main_menu(is_admin) if message.chat.type == "private" else None
+    if _command_name(message) in ("start", "menu"):
+        await message.answer(welcome(message.from_user.first_name or "трейдер", is_admin), reply_markup=menu)
+        return
     text = HELP + ("\n\n" + ADMIN_HELP if is_admin else "")
-    text += "\n\n<i>Подсказка: просто напишите тикер, например <code>SOL</code>, и получите карточку монеты.</i>"
-    await message.answer(text, reply_markup=kb.main_menu(is_admin) if message.chat.type == "private" else None)
+    await message.answer(text, reply_markup=menu)
 
 
 @router.message(Command("myid"))
@@ -213,21 +216,52 @@ async def btn_cancel(message: Message, deps: Deps, state: FSMContext) -> None:
 
 # ------------------------------------------------------------------ top / exp
 
-def _parse_top_args(args: str | None, settings: Settings) -> tuple[str, int, str] | None:
-    """'/top 4h 20 long' in any order -> (interval, n, direction). None on bad input."""
-    interval, n, direction = settings.interval, settings.top_n, "all"
-    for token in (args or "").split():
+class TopQuery:
+    """Everything that defines one top view."""
+
+    def __init__(self, settings: Settings, by: str = "atr"):
+        self.by = by
+        self.interval = settings.interval
+        self.n = settings.top_n
+        self.direction = "all"
+        self.view = "list"
+        self.min_volume = 0.0
+        self.min_cap = 0.0
+
+
+def _parse_top_args(args: str | None, settings: Settings, by: str) -> TopQuery | None:
+    """'/top 4h 20 long vol 20m cap>1b' in any order. None on bad input."""
+    q = TopQuery(settings, by)
+    tokens = (args or "").split()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
         tf = parse_timeframe(token)
         d = parse_direction(token)
+        f = parse_filter(token)
         if tf is not None and tf in settings.intervals:
-            interval = tf
+            q.interval = tf
         elif d is not None:
-            direction = d
+            q.direction = d
+        elif f is not None:
+            kind, value = f
+            if value is None:  # value in the next token
+                value = parse_amount(tokens[i + 1]) if i + 1 < len(tokens) else None
+                if value is None:
+                    return None
+                i += 1
+            if kind == "vol":
+                q.min_volume = value
+            else:
+                q.min_cap = value
         elif token.isdigit():
-            n = max(1, min(50, int(token)))
+            q.n = max(1, min(50, int(token)))
+        elif token.lower() in ("table", "таблица"):
+            q.view = "table"
         else:
             return None
-    return interval, n, direction
+        i += 1
+    return q
 
 
 async def _scan_and_record(deps: Deps, interval: str, force: bool = False) -> ScanResult:
@@ -238,34 +272,37 @@ async def _scan_and_record(deps: Deps, interval: str, force: bool = False) -> Sc
     return result
 
 
-def _top_text(deps: Deps, result: ScanResult, n: int, by: str, direction: str) -> str:
-    rows = result.top(n, by, direction)
+def _top_text(deps: Deps, result: ScanResult, q: TopQuery) -> str:
+    rows = result.top(q.n, q.by, q.direction, q.min_volume, q.min_cap)
     streaks = deps.store.streaks(result.interval, result.candle_time, [m.symbol for m in rows]) if rows else {}
-    return format_top(result, n, by, direction, streaks)
+    return format_top(result, q.n, q.by, q.direction, streaks, q.view, q.min_volume, q.min_cap)
 
 
-async def show_top(message: Message, deps: Deps, by: str, interval: str, n: int, direction: str, edit: bool = False, force: bool = False) -> None:
-    status = message if edit else await message.answer(f"⏳ Сканирую рынок · {tf_name(interval)}…")
+def _top_kb(deps: Deps, q: TopQuery):
+    return kb.top_keyboard(deps.settings, q.by, q.interval, q.n, q.direction, q.view, q.min_volume, q.min_cap)
+
+
+async def show_top(message: Message, deps: Deps, q: TopQuery, edit: bool = False, force: bool = False) -> None:
+    status = message if edit else await message.answer(f"⏳ Сканирую рынок · {tf_name(q.interval)}…")
     try:
-        result = await _scan_and_record(deps, interval, force=force)
+        result = await _scan_and_record(deps, q.interval, force=force)
     except ExchangeError as exc:
         log.exception("scan failed")
-        await _safe_edit(status, f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
+        await _safe_edit(status, f"😕 Биржа не ответила: <code>{html.escape(str(exc)[:200])}</code>\nПопробуйте ещё раз через минуту.")
         return
-    await _safe_edit(status, _top_text(deps, result, n, by, direction), kb.top_keyboard(deps.settings, by, interval, n, direction))
+    await _safe_edit(status, _top_text(deps, result, q), _top_kb(deps, q))
 
 
 async def _send_top(message: Message, command: CommandObject, deps: Deps, by: str) -> None:
-    parsed = _parse_top_args(command.args, deps.settings)
-    if parsed is None:
+    q = _parse_top_args(command.args, deps.settings, by)
+    if q is None:
         tfs = ", ".join(deps.settings.intervals)
         await message.answer(
-            f"Использование: <code>/{command.command} [таймфрейм] [N] [long|short]</code>\n"
-            f"Например <code>/{command.command} 4h 20 long</code>. Таймфреймы: {tfs}"
+            f"Использование: <code>/{command.command} [таймфрейм] [N] [long|short] [vol 20m] [cap 1b]</code>\n"
+            f"Например <code>/{command.command} 4h 20 long cap 300m</code>. Таймфреймы: {tfs}"
         )
         return
-    interval, n, direction = parsed
-    await show_top(message, deps, by, interval, n, direction)
+    await show_top(message, deps, q)
 
 
 @router.message(Command("top"))
@@ -281,29 +318,33 @@ async def cmd_exp(message: Message, command: CommandObject, deps: Deps) -> None:
 @router.message(F.text == kb.BTN_TOP)
 async def btn_top(message: Message, deps: Deps, state: FSMContext) -> None:
     await state.clear()
-    await show_top(message, deps, "atr", deps.settings.interval, deps.settings.top_n, "all")
+    await show_top(message, deps, TopQuery(deps.settings, "atr"))
 
 
 @router.message(F.text == kb.BTN_EXP)
 async def btn_exp(message: Message, deps: Deps, state: FSMContext) -> None:
     await state.clear()
-    await show_top(message, deps, "expansion", deps.settings.interval, deps.settings.top_n, "all")
+    await show_top(message, deps, TopQuery(deps.settings, "expansion"))
 
 
 @router.callback_query(F.data.startswith("top:"))
 async def cb_top(query: CallbackQuery, deps: Deps) -> None:
     parts = query.data.split(":")
-    if len(parts) < 5:
+    if len(parts) < 8:
         await query.answer()
         return
-    _, by, interval, n_s, direction = parts[:5]
-    refresh = len(parts) > 5 and parts[5] == "r"
-    if interval not in deps.settings.intervals or by not in ("atr", "expansion") or direction not in DIRECTION_TITLES:
+    _, by, interval, n_s, direction, view, vol_s, cap_s = parts[:8]
+    refresh = len(parts) > 8 and parts[8] == "r"
+    if (interval not in deps.settings.intervals or by not in ("atr", "expansion") or direction not in DIRECTION_TITLES
+            or view not in VIEWS or not vol_s.isdigit() or not cap_s.isdigit()):
         await query.answer()
         return
-    n = max(1, min(50, int(n_s))) if n_s.isdigit() else deps.settings.top_n
+    q = TopQuery(deps.settings, by)
+    q.interval, q.direction, q.view = interval, direction, view
+    q.n = max(1, min(50, int(n_s))) if n_s.isdigit() else deps.settings.top_n
+    q.min_volume, q.min_cap = int(vol_s) * 1e6, int(cap_s) * 1e6
     await query.answer("Обновляю…" if refresh else None)
-    await show_top(query.message, deps, by, interval, n, direction, edit=True, force=refresh)
+    await show_top(query.message, deps, q, edit=True, force=refresh)
 
 
 # ------------------------------------------------------------------ symbol card / chart
@@ -313,7 +354,7 @@ async def show_symbol(message: Message, deps: Deps, uid: int, symbol: str, edit:
     try:
         per_tf = await deps.scanner.symbol_metrics(symbol)
     except ExchangeError as exc:
-        await _safe_edit(status, f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
+        await _safe_edit(status, f"😕 Биржа не ответила: <code>{html.escape(str(exc)[:200])}</code>")
         return
     if per_tf is None:
         await _safe_edit(status, f"Не нашёл монету <code>{html.escape(symbol.upper())}</code> на {deps.settings.exchange}.")
@@ -326,7 +367,7 @@ async def show_symbol(message: Message, deps: Deps, uid: int, symbol: str, edit:
         if last and rank:
             ranks[tf] = (rank, len(last.ranked))
     watched = name in deps.store.watchlist(uid)
-    await _safe_edit(status, format_symbol(name, per_tf, ranks), kb.symbol_keyboard(deps.settings, name, watched))
+    await _safe_edit(status, format_symbol(name, per_tf, ranks, watched), kb.symbol_keyboard(deps.settings, name, watched))
 
 
 @router.message(Command("atr"))
@@ -390,7 +431,7 @@ async def cmd_chart(message: Message, command: CommandObject, deps: Deps) -> Non
     try:
         res = await _chart_png(deps, symbol, interval)
     except ExchangeError as exc:
-        await status.edit_text(f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
+        await status.edit_text(f"😕 Биржа не ответила: <code>{html.escape(str(exc)[:200])}</code>")
         return
     if res is None:
         await status.edit_text(f"Не нашёл монету <code>{html.escape(symbol.upper())}</code>.")
@@ -414,7 +455,7 @@ async def cb_chart(query: CallbackQuery, deps: Deps) -> None:
     try:
         res = await _chart_png(deps, symbol, interval)
     except ExchangeError as exc:
-        await query.message.answer(f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
+        await query.message.answer(f"😕 Биржа не ответила: <code>{html.escape(str(exc)[:200])}</code>")
         return
     if res is None:
         return
@@ -443,7 +484,7 @@ async def show_watchlist(message: Message, deps: Deps, uid: int, edit: bool = Fa
     try:
         metrics = await deps.scanner.metrics_for(symbols, deps.settings.interval)
     except ExchangeError as exc:
-        await _safe_edit(status, f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
+        await _safe_edit(status, f"😕 Биржа не ответила: <code>{html.escape(str(exc)[:200])}</code>")
         return
     await _safe_edit(status, format_watchlist(symbols, metrics, deps.settings.interval), kb.watchlist_keyboard(symbols))
 
@@ -476,7 +517,7 @@ async def cmd_watch(message: Message, command: CommandObject, deps: Deps) -> Non
     try:
         text = await _watch_add_many(message.bot, deps, message.from_user.id, parts)
     except ExchangeError as exc:
-        await message.answer(f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>")
+        await message.answer(f"😕 Биржа не ответила: <code>{html.escape(str(exc)[:200])}</code>")
         return
     await message.answer(text)
 
@@ -554,7 +595,7 @@ async def ask_watch_input(message: Message, deps: Deps, state: FSMContext) -> No
     try:
         text = await _watch_add_many(message.bot, deps, message.from_user.id, tokens)
     except ExchangeError as exc:
-        await message.answer(f"❌ Ошибка биржи: <code>{html.escape(str(exc))}</code>", reply_markup=menu)
+        await message.answer(f"😕 Биржа не ответила: <code>{html.escape(str(exc)[:200])}</code>", reply_markup=menu)
         return
     await message.answer(text, reply_markup=menu)
     await show_watchlist(message, deps, message.from_user.id)
@@ -914,7 +955,10 @@ async def _breakout_alerts(bot: Bot, deps: Deps, result: ScanResult) -> None:
     if not hits:
         return
     hits.sort(key=lambda m: m.last_tr_ratio, reverse=True)
-    await _broadcast(bot, deps, chats, format_breakouts(hits[:15], result.interval, s.alert_tr_ratio))
+    await _broadcast(
+        bot, deps, chats, format_breakouts(hits[:15], result.interval, s.alert_tr_ratio),
+        reply_markup=kb.symbols_keyboard([m.symbol for m in hits[:6]]),
+    )
 
 
 async def _watch_alerts(bot: Bot, deps: Deps, interval: str) -> None:
@@ -951,8 +995,9 @@ async def _after_close(bot: Bot, deps: Deps, interval: str, sub_kind: str) -> No
         return
     chats = deps.store.subscribed(sub_kind)
     if chats:
-        text = _top_text(deps, result, deps.settings.top_n, "atr", "all")
-        await _broadcast(bot, deps, chats, text, reply_markup=kb.top_keyboard(deps.settings, "atr", interval, deps.settings.top_n, "all"))
+        q = TopQuery(deps.settings, "atr")
+        q.interval = interval
+        await _broadcast(bot, deps, chats, _top_text(deps, result, q), reply_markup=_top_kb(deps, q))
     if interval == "1h":
         await _breakout_alerts(bot, deps, result)
     try:

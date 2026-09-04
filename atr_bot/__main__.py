@@ -41,7 +41,7 @@ async def _scan_cli(args: argparse.Namespace) -> None:
             print(_strip_html(format_symbol(scanner.normalize_symbol(args.symbol), per_tf, {})) if per_tf else "symbol not found")
             return
         result = await scanner.scan(settings.interval, force=True)
-        print(_strip_html(format_top(result, args.top or settings.top_n)))
+        print(_strip_html(format_top(result, args.top or settings.top_n, view=args.view)))
         print(f"\n{len(result.ranked)} coins ranked, {result.errors} errors, {result.duration:.1f}s")
 
 
@@ -56,6 +56,7 @@ def main(argv: list[str] | None = None) -> None:
     scan.add_argument("--lookback", type=int, default=None)
     scan.add_argument("--volume", type=float, default=None, help="min 24h quote volume")
     scan.add_argument("--symbol", default=None, help="details for one symbol instead of the ranking")
+    scan.add_argument("--view", default="list", choices=["list", "table"])
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 

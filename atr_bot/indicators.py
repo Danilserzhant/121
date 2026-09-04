@@ -75,6 +75,7 @@ class AtrMetrics:
     vol_ratio: float      # last candle volume / average volume of the lookback window
     quote_volume: float   # 24h quote volume
     candle_time: int      # open time (ms) of the last candle used
+    market_cap: float = 0.0  # USD, 0 = unknown
 
     @property
     def direction(self) -> str:
@@ -87,6 +88,7 @@ def compute_metrics(
     period: int,
     lookback: int,
     quote_volume: float = 0.0,
+    market_cap: float = 0.0,
 ) -> AtrMetrics | None:
     """Compute ATR expansion metrics for one symbol.
 
@@ -126,6 +128,7 @@ def compute_metrics(
         vol_ratio=vol_ratio,
         quote_volume=quote_volume,
         candle_time=last.open_time,
+        market_cap=market_cap,
     )
 
 

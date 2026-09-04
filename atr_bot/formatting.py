@@ -12,21 +12,57 @@ TF_NAMES = {"1h": "1ч", "4h": "4ч", "1d": "1Д", "1w": "1Н"}
 TF_UNIT = {"1h": "час", "4h": "4 часа", "1d": "день", "1w": "неделю"}
 TF_PLURAL = {"1h": "ч", "4h": "×4ч", "1d": "дн", "1w": "нед"}
 
-# Anything a user may type to name a timeframe.
 TF_ALIASES = {
     "1h": {"1h", "h", "1ч", "ч", "час", "hour", "60"},
     "4h": {"4h", "4", "4ч", "240"},
     "1d": {"1d", "d", "1д", "д", "день", "day", "дн", "daily"},
     "1w": {"1w", "w", "1н", "н", "неделя", "week", "нед", "weekly"},
 }
-
-
 DIRECTION_ALIASES = {
     "long": {"long", "лонг", "up", "вверх", "l", "л", "рост"},
     "short": {"short", "шорт", "down", "вниз", "s", "ш", "слив"},
     "all": {"all", "все", "всё", "any"},
 }
-DIRECTION_TITLES = {"long": "только рост", "short": "только падение", "all": ""}
+DIRECTION_TITLES = {"long": "🟢 только рост", "short": "🔴 только падение", "all": ""}
+VIEWS = ("list", "table")
+MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+LINE = "━━━━━━━━━━━━━━━━━━"
+
+
+import re as _re
+
+_AMOUNT_RE = _re.compile(r"^(\d+(?:[.,]\d+)?)\s*([kmb]|к|м|млн|млрд|b|тыс)?$", _re.I)
+_FILTER_KEYS = {
+    "vol": {"vol", "v", "volume", "оборот", "об", "объём", "объем"},
+    "cap": {"cap", "c", "mcap", "marketcap", "капа", "кап", "капитализация", "mc"},
+}
+_MULT = {"k": 1e3, "к": 1e3, "тыс": 1e3, "m": 1e6, "м": 1e6, "млн": 1e6, "b": 1e9, "млрд": 1e9}
+
+
+def parse_amount(token: str) -> float | None:
+    """'20m' -> 20_000_000, '1.5b' -> 1.5e9, '500k' -> 500_000, '5000000' -> 5e6."""
+    m = _AMOUNT_RE.match(token.strip().lower())
+    if not m:
+        return None
+    value = float(m.group(1).replace(",", "."))
+    unit = (m.group(2) or "").lower()
+    return value * _MULT.get(unit, 1.0)
+
+
+def parse_filter(token: str) -> tuple[str, float] | tuple[str, None] | None:
+    """'vol>20m' / 'cap1b' -> ('vol', 2e7); bare 'cap' -> ('cap', None) (value in next token)."""
+    t = token.strip().lower().lstrip("≥>=")
+    m = _re.match(r"^([a-zа-яё]+)\s*[>=:≥]*\s*(.*)$", t)
+    if not m:
+        return None
+    key, rest = m.group(1), m.group(2)
+    kind = next((k for k, names in _FILTER_KEYS.items() if key in names), None)
+    if kind is None:
+        return None
+    if not rest:
+        return kind, None
+    value = parse_amount(rest)
+    return (kind, value) if value is not None else None
 
 
 def parse_direction(token: str) -> str | None:
@@ -49,16 +85,33 @@ def tf_name(interval: str) -> str:
     return TF_NAMES.get(interval, interval)
 
 
-def _fmt_price(p: float) -> str:
+# ------------------------------------------------------------------ small helpers
+
+def fmt_price(p: float) -> str:
     if p >= 1000:
         return f"{p:,.1f}"
     if p >= 1:
-        return f"{p:.4f}"
+        return f"{p:.4f}".rstrip("0").rstrip(".")
     return f"{p:.6g}"
+
+
+def fmt_big(v: float) -> str:
+    """5_400_000 -> '5.4M', 1_130_000_000 -> '1.13B'."""
+    if v >= 1e9:
+        return f"{v/1e9:.2f}".rstrip("0").rstrip(".") + "B"
+    if v >= 1e6:
+        return f"{v/1e6:.1f}".rstrip("0").rstrip(".") + "M"
+    if v >= 1e3:
+        return f"{v/1e3:.0f}K"
+    return f"{v:.0f}"
 
 
 def _sign(v: float, digits: int = 1) -> str:
     return f"{v:+.{digits}f}%"
+
+
+def _arrow(move: float) -> str:
+    return "🟢" if move > 0 else "🔴" if move < 0 else "⚪️"
 
 
 def _utc(ts_ms: int, interval: str = "1h") -> str:
@@ -70,13 +123,53 @@ def _window(interval: str, lookback: int) -> str:
     return f"{lookback}{TF_PLURAL.get(interval, ' свеч')}"
 
 
-def _short(symbol: str, width: int = 8) -> str:
+def short_symbol(symbol: str, width: int = 10) -> str:
     sym = symbol.removesuffix("USDT") if symbol.endswith("USDT") else symbol
     return sym[:width]
 
 
 def _vol(v: float) -> str:
-    return f"x{v:.1f}" if v < 10 else f"x{v:.0f}"
+    return f"×{v:.1f}" if v < 10 else f"×{v:.0f}"
+
+
+def _streak(st: int) -> str:
+    if st == 1:
+        return "🆕"
+    if st >= 2:
+        return f"🔥{st}"
+    return ""
+
+
+def _now_utc() -> str:
+    return datetime.now(tz=timezone.utc).strftime("%H:%M")
+
+
+# ------------------------------------------------------------------ top
+
+def _top_header(result: ScanResult, by: str, direction: str, min_volume: float = 0.0, min_cap: float = 0.0) -> str:
+    tf = result.interval
+    title = "📈 Топ по росту ATR" if by == "expansion" else "📊 Топ по ATR%"
+    dir_txt = f"  {DIRECTION_TITLES[direction]}" if direction != "all" else ""
+    filters = []
+    if min_volume > 0:
+        filters.append(f"оборот ≥ {fmt_big(min_volume)}")
+    if min_cap > 0:
+        filters.append(f"капа ≥ {fmt_big(min_cap)}")
+    filt = ("\n<i>🔍 " + " · ".join(filters) + "</i>") if filters else ""
+    return (
+        f"<b>{title} · {tf_name(tf)}</b>{dir_txt}\n"
+        f"<i>{html.escape(result.exchange)} · свеча {_utc(result.candle_time, tf)} UTC · "
+        f"{len(result.ranked)} монет · окно {_window(tf, result.lookback)}</i>{filt}\n"
+    )
+
+
+def _top_footer(result: ScanResult) -> str:
+    tf = result.interval
+    return (
+        f"\n<i>ATR — средний ход за {TF_UNIT.get(tf, 'свечу')} · св — последняя свеча · "
+        f"Δ — рост ATR за {_window(tf, result.lookback)} · × — объём свечи к среднему · об. — оборот 24ч · 🔥 — свечей подряд в топ-20 · "
+        f"обновлено {_now_utc()} UTC</i>"
+    )
 
 
 def format_top(
@@ -85,149 +178,170 @@ def format_top(
     by: str = "atr",
     direction: str = "all",
     streaks: dict[str, int] | None = None,
+    view: str = "list",
+    min_volume: float = 0.0,
+    min_cap: float = 0.0,
 ) -> str:
-    rows = result.top(n, by, direction)
-    tf = result.interval
+    rows = result.top(n, by, direction, min_volume, min_cap)
+    head = _top_header(result, by, direction, min_volume, min_cap)
     if not rows:
-        return f"Нет монет под фильтр ({tf_name(tf)}{', ' + DIRECTION_TITLES[direction] if direction != 'all' else ''})."
-    candle = _utc(rows[0].candle_time, tf)
-    title = "📈 <b>Топ по росту ATR" if by == "expansion" else "📊 <b>Топ по ATR в % цены"
-    title += f" · {tf_name(tf)}"
-    if direction != "all":
-        title += f" · {DIRECTION_TITLES[direction]}"
-    title += "</b>"
-    head = (
-        f"{title}\n"
-        f"Биржа: {html.escape(result.exchange)} · свеча {candle} UTC\n"
-        f"ATR({result.atr_period}), окно {_window(tf, result.lookback)} · {len(result.ranked)} монет\n"
-    )
-    show_streak = streaks is not None and any(v > 0 for v in streaks.values())
-    header = f"{'#':>2} {'Монета':<8} {'ATR%':>5} {'ΔATR':>5} {'Свеча':>5} {'Ход':>6} {'Объём':>5}"
-    if show_streak:
-        header += f" {'Топ':>3}"
+        return head + "\nНичего не нашлось под этот фильтр."
+    streaks = streaks or {}
+    if view == "table":
+        return head + _top_table(rows, by, streaks) + _top_footer(result)
+    lines = []
+    for i, m in enumerate(rows, start=1):
+        num = MEDALS.get(i, f"{i}.")
+        atr = f"ATR <b>{m.atr_pct:.1f}%</b>" if by == "atr" else f"ATR {m.atr_pct:.1f}%"
+        exp = f"Δ <b>{m.expansion_pct:+.0f}%</b>" if by == "expansion" else f"Δ {m.expansion_pct:+.0f}%"
+        st = _streak(streaks.get(m.symbol, 0))
+        lines.append(
+            f"{num} <b>{short_symbol(m.symbol)}</b>  {_arrow(m.move_pct)} {_sign(m.move_pct)}"
+            + (f"  {st}" if st else "")
+            + f"\n      {atr} · св {m.last_tr_pct:.1f}% · {exp} · {_vol(m.vol_ratio)}"
+            + f"\n      об. {fmt_big(m.quote_volume)}" + (f" · капа {fmt_big(m.market_cap)}" if m.market_cap else "")
+        )
+    return head + "\n".join(lines) + _top_footer(result)
+
+
+def _top_table(rows: list[AtrMetrics], by: str, streaks: dict[str, int]) -> str:
+    show_streak = any(v > 0 for v in streaks.values())
+    header = f"{'#':>2} {'Монета':<8} {'ATR%':>5} {'Δ%':>5} {'Св%':>5} {'Ход%':>6} {'×об':>4} {'Капа':>5}" + ("  Т" if show_streak else "")
     lines = [header]
     for i, m in enumerate(rows, start=1):
         line = (
-            f"{i:>2} {_short(m.symbol):<8} {m.atr_pct:>4.1f}% {m.expansion_pct:>+4.0f}% "
-            f"{m.last_tr_pct:>4.1f}% {m.move_pct:>+5.1f}% {_vol(m.vol_ratio):>5}"
+            f"{i:>2} {short_symbol(m.symbol, 8):<8} {m.atr_pct:>5.1f} {m.expansion_pct:>+5.0f} "
+            f"{m.last_tr_pct:>5.1f} {m.move_pct:>+6.1f} {m.vol_ratio:>4.1f} {(fmt_big(m.market_cap) if m.market_cap else '—'):>5}"
         )
         if show_streak:
             st = streaks.get(m.symbol, 0)
-            line += f" {'new' if st == 1 else (str(st) if st > 1 else '·'):>3}"
+            line += f" {'н' if st == 1 else (str(st) if st > 1 else '·'):>2}"
         lines.append(line)
-    table = "<pre>" + html.escape("\n".join(lines)) + "</pre>"
-    legend = (
-        f"\n<i>ATR% — средний ход за {TF_UNIT.get(tf, 'свечу')} в % цены · ΔATR — рост ATR за "
-        f"{_window(tf, result.lookback)} · Свеча — диапазон последней свечи · "
-        f"Ход — движение за {_window(tf, result.lookback)} · Объём — последняя свеча к среднему"
-    )
-    if show_streak:
-        legend += " · Топ — сколько свечей подряд в топ-20, new — только зашла"
-    legend += "</i>"
-    return head + table + legend
+    return "<pre>" + html.escape("\n".join(lines)) + "</pre>"
 
 
-def format_symbol(symbol: str, per_tf: dict[str, AtrMetrics | None], ranks: dict[str, tuple[int, int]]) -> str:
-    """One coin across all timeframes. ranks: {interval: (rank, total)}."""
+# ------------------------------------------------------------------ symbol card
+
+def format_symbol(symbol: str, per_tf: dict[str, AtrMetrics | None], ranks: dict[str, tuple[int, int]], watched: bool = False) -> str:
     first = next((m for m in per_tf.values() if m is not None), None)
     if first is None:
-        return f"По <code>{html.escape(symbol)}</code> слишком мало истории."
-    lines = [f"{'ТФ':<3} {'ATR%':>6} {'ΔATR':>6} {'Свеча':>6} {'Ход':>7} {'Объём':>5} {'Место':>6}"]
+        return f"По <b>{html.escape(symbol)}</b> слишком мало истории."
+    head = (
+        f"🔎 <b>{html.escape(symbol)}</b>{'  👀' if watched else ''}\n"
+        f"Цена <code>{fmt_price(first.close)}</code> · оборот 24ч <b>{fmt_big(first.quote_volume)}</b>"
+        + (f" · капа <b>{fmt_big(first.market_cap)}</b>" if first.market_cap else "") + f"\n{LINE}\n"
+    )
+    lines = []
     for tf, m in per_tf.items():
         if m is None:
-            lines.append(f"{tf_name(tf):<3} {'—':>6}  мало истории")
+            lines.append(f"<b>{tf_name(tf)}</b>  мало истории")
             continue
         rank = ranks.get(tf)
-        rank_txt = f"#{rank[0]}/{rank[1]}" if rank else "—"
+        rank_txt = f" · #{rank[0]} из {rank[1]}" if rank else ""
         lines.append(
-            f"{tf_name(tf):<3} {m.atr_pct:>5.2f}% {m.expansion_pct:>+5.0f}% {m.last_tr_pct:>5.1f}% {m.move_pct:>+6.1f}% {_vol(m.vol_ratio):>5} {rank_txt:>6}"
+            f"<b>{tf_name(tf):<2}</b>  ATR <b>{m.atr_pct:.2f}%</b> · Δ {m.expansion_pct:+.0f}%\n"
+            f"      св {m.last_tr_pct:.1f}% ({m.last_tr_ratio:.1f}×) · {_arrow(m.move_pct)} {_sign(m.move_pct)} · {_vol(m.vol_ratio)}{rank_txt}"
         )
     return (
-        f"🔎 <b>{html.escape(symbol)}</b> · цена <code>{_fmt_price(first.close)}</code> · "
-        f"оборот 24ч {first.quote_volume/1e6:.1f}M\n"
-        "<pre>" + html.escape("\n".join(lines)) + "</pre>\n"
-        "<i>ATR% — средний ход за свечу в % цены · ΔATR — рост ATR к окну сравнения · "
-        "Ход — движение за окно · Объём — последняя свеча к среднему · Место — в рейтинге по ATR% (если сканировали)</i>"
+        head + "\n".join(lines) + f"\n{LINE}\n"
+        "<i>ATR — средний ход за свечу · Δ — рост ATR к окну · св — последняя свеча и сколько это старых ATR · "
+        "× — объём к среднему · # — место в топе по ATR%</i>"
     )
 
 
-def format_settings(s) -> str:  # noqa: ANN001 - Settings, avoid circular import in typing
-    lookbacks = ", ".join(f"{tf_name(tf)}: {s.lookback_for(tf)}" for tf in s.intervals)
-    return (
-        "⚙️ <b>Настройки сканера</b>\n"
-        f"Биржа: <code>{html.escape(s.exchange)}</code> · котировка {s.quote_asset}\n"
-        f"Таймфрейм по умолчанию: <code>{s.interval}</code> (доступны {', '.join(s.intervals)})\n"
-        f"ATR период: <code>{s.atr_period}</code>\n"
-        f"Окно сравнения (свечей): {lookbacks}\n"
-        f"Топ по умолчанию: <code>{s.top_n}</code>\n"
-        f"Мин. оборот 24ч: <code>{s.min_quote_volume:,.0f}</code> {s.quote_asset}\n"
-        f"Мин. ATR%: <code>{s.min_atr_pct}</code>\n"
-        f"Кэш результата: <code>{s.cache_ttl}</code> с\n\n"
-        f"Алерт свеча-выброс: ≥ <code>{s.alert_tr_ratio:g}</code>× ATR и ≥ <code>{s.alert_min_tr_pct:g}</code>% свеча\n"
-        f"Алерт по своим монетам: ≥ <code>{s.watch_tr_ratio:g}</code>× ATR или ΔATR ≥ <code>{s.watch_expansion_pct:g}</code>%\n\n"
-        "Изменить: <code>/set период 14</code>, <code>/set окно 4h 6</code>, "
-        "<code>/set топ 20</code>, <code>/set оборот 10000000</code>, <code>/set atr 1.5</code>, "
-        "<code>/set выброс 2.5</code>, <code>/set watch 2</code>, <code>/set рост 50</code>"
-    )
-
-
-HELP = (
-    "🤖 <b>ATR Bot</b>\n"
-    "Считаю ATR для всех монет биржи и показываю самые волатильные — "
-    "ATR в % цены, то есть чистое движение за свечу.\n\n"
-    "<b>Команды</b>\n"
-    "/top — топ по ATR% на часовых свечах\n"
-    "/top 4h, /top 1d, /top 1w — то же на 4ч, дневных, недельных\n"
-    "/top 1d 30 — можно указать и количество монет\n"
-    "/exp [тф] [N] — топ по росту ATR (волатильность расширяется)\n"
-    "/top 1d long, /top short — только растущие или только падающие\n"
-    "/atr SOL — монета на всех таймфреймах сразу\n"
-    "/chart SOL [тф] — график свечей и ATR картинкой\n"
-    "/watch SOL, /unwatch SOL, /watchlist — мои монеты; по ним приходят алерты\n"
-    "/sub — часовой топ после закрытия каждой свечи\n"
-    "/sub 1d — дневной топ после закрытия дня\n"
-    "/sub alerts — алерты «свеча-выброс» по всему рынку\n"
-    "/unsub [1h|1d|alerts] — отключить рассылку (без аргумента — все)\n"
-    "/myid — мой Telegram ID и роль\n"
-    "/help — эта справка"
-)
-
+# ------------------------------------------------------------------ alerts / watchlist
 
 def format_breakouts(rows: list[AtrMetrics], interval: str, ratio: float) -> str:
     candle = _utc(rows[0].candle_time, interval)
-    lines = [f"🚨 <b>Свеча-выброс · {tf_name(interval)}</b> · свеча {candle} UTC · ≥{ratio:g}× ATR\n"]
+    head = f"🚨 <b>Свеча-выброс · {tf_name(interval)}</b>\n<i>свеча {candle} UTC · порог {ratio:g}× ATR</i>\n{LINE}\n"
+    lines = []
     for m in sorted(rows, key=lambda m: m.last_tr_ratio, reverse=True):
-        arrow = "🟢" if m.move_pct > 0 else "🔴"
         lines.append(
-            f"{arrow} <b>{_short(m.symbol, 12)}</b> свеча {m.last_tr_pct:.1f}% = {m.last_tr_ratio:.1f}× ATR · "
-            f"объём {_vol(m.vol_ratio)} · ATR {m.atr_pct:.2f}% · ход {_sign(m.move_pct)}"
+            f"{_arrow(m.move_pct)} <b>{short_symbol(m.symbol, 12)}</b>  св <b>{m.last_tr_pct:.1f}%</b> = {m.last_tr_ratio:.1f}× ATR"
+            f"\n      ATR {m.atr_pct:.2f}% · {_vol(m.vol_ratio)} · ход {_sign(m.move_pct)}"
         )
-    return "\n".join(lines)
+    return head + "\n".join(lines)
 
 
 def format_watch_alert(m: AtrMetrics, interval: str, reasons: list[str]) -> str:
-    arrow = "🟢" if m.move_pct > 0 else "🔴"
     return (
-        f"👀 {arrow} <b>{html.escape(m.symbol)}</b> · {tf_name(interval)} · свеча {_utc(m.candle_time, interval)} UTC\n"
+        f"👀 {_arrow(m.move_pct)} <b>{html.escape(m.symbol)}</b> · {tf_name(interval)} · свеча {_utc(m.candle_time, interval)} UTC\n"
         + "\n".join(f"• {r}" for r in reasons)
-        + f"\nATR {m.atr_pct:.2f}% · свеча {m.last_tr_pct:.1f}% ({m.last_tr_ratio:.1f}× ATR) · "
-        f"объём {_vol(m.vol_ratio)} · ход {_sign(m.move_pct)} · цена <code>{_fmt_price(m.close)}</code>"
+        + f"\n{LINE}\nATR {m.atr_pct:.2f}% · св {m.last_tr_pct:.1f}% ({m.last_tr_ratio:.1f}×) · {_vol(m.vol_ratio)} · "
+        f"ход {_sign(m.move_pct)} · цена <code>{fmt_price(m.close)}</code>"
     )
 
 
 def format_watchlist(symbols: list[str], metrics: dict[str, AtrMetrics | None], interval: str) -> str:
     if not symbols:
-        return "Список пуст. Добавить: <code>/watch SOL</code>"
-    lines = [f"{'Монета':<8} {'ATR%':>5} {'ΔATR':>5} {'Свеча':>5} {'Ход':>6} {'Объём':>5}"]
+        return (
+            "👀 <b>Мои монеты</b>\n\nСписок пуст. Нажмите «➕ Добавить» или напишите <code>/watch SOL ETH</code>.\n"
+            "По монетам из списка приходят личные алерты, когда свеча выходит за ATR или ATR резко растёт."
+        )
+    lines = []
     for sym in symbols:
         m = metrics.get(sym)
         if m is None:
-            lines.append(f"{_short(sym):<8}   нет данных")
+            lines.append(f"<b>{short_symbol(sym)}</b>  нет данных")
             continue
         lines.append(
-            f"{_short(sym):<8} {m.atr_pct:>4.1f}% {m.expansion_pct:>+4.0f}% {m.last_tr_pct:>4.1f}% {m.move_pct:>+5.1f}% {_vol(m.vol_ratio):>5}"
+            f"{_arrow(m.move_pct)} <b>{short_symbol(sym)}</b>  {_sign(m.move_pct)} · <code>{fmt_price(m.close)}</code>"
+            f"\n      ATR <b>{m.atr_pct:.1f}%</b> · св {m.last_tr_pct:.1f}% ({m.last_tr_ratio:.1f}×) · Δ {m.expansion_pct:+.0f}% · {_vol(m.vol_ratio)}"
         )
     return (
-        f"👀 <b>Мои монеты · {tf_name(interval)}</b>\n<pre>" + html.escape("\n".join(lines)) + "</pre>\n"
-        "<i>Убрать: /unwatch SOL · очистить: /unwatch all</i>"
+        f"👀 <b>Мои монеты · {tf_name(interval)}</b>\n<i>{len(symbols)} монет · обновлено {_now_utc()} UTC</i>\n{LINE}\n"
+        + "\n".join(lines)
     )
+
+
+# ------------------------------------------------------------------ settings / help
+
+def format_settings(s) -> str:  # noqa: ANN001 - Settings, avoid circular import in typing
+    lookbacks = " · ".join(f"{tf_name(tf)} {s.lookback_for(tf)}" for tf in s.intervals)
+    return (
+        "⚙️ <b>Настройки</b>\n"
+        f"{LINE}\n"
+        f"Биржа: <b>{html.escape(s.exchange)}</b> · {s.quote_asset}\n"
+        f"ATR период: <b>{s.atr_period}</b> · окно Δ: {lookbacks}\n"
+        f"Топ: <b>{s.top_n}</b> монет · мин. оборот <b>{fmt_big(s.min_quote_volume)}</b> · мин. ATR <b>{s.min_atr_pct:g}%</b>\n"
+        f"Свеча-выброс: ≥ <b>{s.alert_tr_ratio:g}×</b> ATR и ≥ {s.alert_min_tr_pct:g}% свеча\n"
+        f"Мои монеты: ≥ <b>{s.watch_tr_ratio:g}×</b> ATR или Δ ≥ <b>{s.watch_expansion_pct:g}%</b>\n"
+        f"{LINE}\n"
+        "<i>Кнопками ниже или текстом: /set период 14, /set окно 4h 6, /set топ 20, "
+        "/set оборот 10000000, /set atr 1.5, /set выброс 2.5, /set watch 2, /set рост 50</i>"
+    )
+
+
+def welcome(name: str, is_admin: bool) -> str:
+    text = (
+        f"👋 Привет, <b>{html.escape(name)}</b>!\n\n"
+        "Я ищу самые волатильные монеты по ATR в % от цены на 1ч, 4ч, дневных и недельных свечах.\n\n"
+        "📊 <b>Топ ATR</b> — кто ходит сильнее всех\n"
+        "📈 <b>Рост ATR</b> — у кого волатильность просыпается\n"
+        "👀 <b>Мои монеты</b> — свой список с личными алертами\n"
+        "🔎 <b>Монета</b> — карточка и график. Или просто напишите тикер: <code>SOL</code>\n"
+        "🔔 <b>Подписки</b> — часовой и дневной топ, алерты «свеча-выброс»\n"
+    )
+    if is_admin:
+        text += "⚙️ <b>Настройки</b>, 👥 <b>Пользователи</b>, 📨 <b>Заявки</b> — админка\n"
+    return text + "\nПолный список команд — /help"
+
+
+HELP = (
+    "🤖 <b>ATR Bot — команды</b>\n"
+    f"{LINE}\n"
+    "/top — топ по ATR% на часовых свечах\n"
+    "/top 4h, /top 1d, /top 1w — другие таймфреймы\n"
+    "/top 1d 30 long — количество и направление\n"
+    "/top vol 20m cap 300m — оборот 24ч и капитализация не меньше\n"
+    "/exp [тф] [N] — топ по росту ATR\n"
+    "/atr SOL — карточка монеты на всех таймфреймах\n"
+    "/chart SOL 4h — график свечей и ATR\n"
+    "/watch SOL ETH · /unwatch SOL · /watchlist — мои монеты\n"
+    "/subs — рассылки в этот чат (или /sub, /sub 1d, /sub alerts, /unsub)\n"
+    "/myid — мой ID и роль · /menu — клавиатура\n"
+    f"{LINE}\n"
+    "<i>ATR% — средний диапазон свечи в % цены (Wilder 14). "
+    "Δ — насколько ATR вырос к значению N свечей назад. "
+    "Свеча-выброс — последняя свеча больше N старых ATR.</i>"
+)
