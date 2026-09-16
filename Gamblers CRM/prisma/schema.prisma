@@ -1,0 +1,175 @@
+// Gamblers CRM — аналитика трафика и удержания аудитории Telegram-потока.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Отслеживаемый чат или канал (группа потока, основной канал, VIP).
+model Chat {
+  id           Int       @id @default(autoincrement())
+  tgChatId     BigInt    @unique
+  title        String
+  /// group | channel
+  type         String    @default("group")
+  /// Роль в воронке: main | channel | vip
+  role         String    @default("main")
+  accessHash   String?
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now()) @db.Timestamptz(3)
+  lastSyncedAt DateTime? @db.Timestamptz(3)
+
+  memberships  Membership[]
+  messages     Message[]
+  events       Event[]
+  inviteLinks  InviteLink[]
+}
+
+/// Источник трафика: блогер, закуп, посев, органика. К нему привязаны invite-ссылки.
+model Source {
+  id        Int      @id @default(autoincrement())
+  slug      String   @unique
+  title     String
+  /// blogger | ads | seeding | organic | partner | other
+  kind      String   @default("other")
+  /// Потрачено на источник, в валюте учёта — для CPL и окупаемости.
+  spend     Decimal? @db.Decimal(12, 2)
+  currency  String   @default("USD")
+  notes     String?
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  inviteLinks InviteLink[]
+  memberships Membership[]
+}
+
+/// Пригласительная ссылка Telegram — единица атрибуции трафика.
+model InviteLink {
+  id         Int       @id @default(autoincrement())
+  /// Полный t.me/+hash
+  link       String    @unique
+  title      String?
+  chatId     Int
+  sourceId   Int?
+  /// Счётчик использований по данным Telegram (сверка с нашими join-ами).
+  tgUsage    Int       @default(0)
+  isRevoked  Boolean   @default(false)
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3)
+  expiresAt  DateTime? @db.Timestamptz(3)
+
+  chat        Chat         @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  source      Source?      @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  memberships Membership[]
+  events      Event[]
+
+  @@index([chatId])
+  @@index([sourceId])
+}
+
+/// Человек — пользователь Telegram, единый по всем чатам.
+model Person {
+  id          Int       @id @default(autoincrement())
+  tgUserId    BigInt    @unique
+  username    String?
+  firstName   String?
+  lastName    String?
+  isBot       Boolean   @default(false)
+  isPremium   Boolean   @default(false)
+  langCode    String?
+  firstSeenAt DateTime  @default(now()) @db.Timestamptz(3)
+  /// Ручные пометки менеджера.
+  note        String?
+
+  memberships Membership[]
+  messages    Message[]
+  events      Event[]
+
+  @@index([username])
+}
+
+/// Участие человека в конкретном чате: когда пришёл, откуда, жив ли ещё.
+model Membership {
+  id            Int       @id @default(autoincrement())
+  personId      Int
+  chatId        Int
+  joinedAt      DateTime @db.Timestamptz(3)
+  leftAt        DateTime? @db.Timestamptz(3)
+  /// active | left | kicked
+  status        String    @default("active")
+  /// Сколько раз человек заходил в этот чат (возвраты).
+  joinCount     Int       @default(1)
+  inviteLinkId  Int?
+  sourceId      Int?
+  inviterTgId   BigInt?
+  /// Денормализация для быстрых выборок по вовлечённости.
+  messageCount  Int       @default(0)
+  firstMessageAt DateTime? @db.Timestamptz(3)
+  lastMessageAt  DateTime? @db.Timestamptz(3)
+
+  person     Person      @relation(fields: [personId], references: [id], onDelete: Cascade)
+  chat       Chat        @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  inviteLink InviteLink? @relation(fields: [inviteLinkId], references: [id], onDelete: SetNull)
+  source     Source?     @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+
+  @@unique([personId, chatId])
+  @@index([chatId, joinedAt])
+  @@index([chatId, status])
+  @@index([sourceId])
+}
+
+/// Сырой журнал событий: вступления, выходы, баны. Источник правды для когорт.
+model Event {
+  id           Int      @id @default(autoincrement())
+  chatId       Int
+  personId     Int
+  /// join | leave | kick | invite_created
+  type         String
+  at           DateTime @db.Timestamptz(3)
+  inviteLinkId Int?
+  inviterTgId  BigInt?
+  /// Дедуп ключ события из admin log / истории чата.
+  dedupKey     String   @unique
+  raw          Json?
+
+  chat       Chat        @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  person     Person      @relation(fields: [personId], references: [id], onDelete: Cascade)
+  inviteLink InviteLink? @relation(fields: [inviteLinkId], references: [id], onDelete: SetNull)
+
+  @@index([chatId, at])
+  @@index([personId, at])
+  @@index([type, at])
+}
+
+/// Сообщение в чате. Текст не храним — только метрики вовлечённости.
+model Message {
+  id             Int      @id @default(autoincrement())
+  chatId         Int
+  personId       Int
+  tgMessageId    BigInt
+  at             DateTime @db.Timestamptz(3)
+  charLen        Int      @default(0)
+  wordCount      Int      @default(0)
+  isReply        Boolean  @default(false)
+  replyToPersonId Int?
+  hasMedia       Boolean  @default(false)
+  /// Похоже на вопрос — маркер «живого» интереса к обучению.
+  isQuestion     Boolean  @default(false)
+  /// Первые 200 символов — включается флагом STORE_MESSAGE_PREVIEW.
+  preview        String?
+
+  chat   Chat   @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  person Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@unique([chatId, tgMessageId])
+  @@index([chatId, at])
+  @@index([personId, at])
+}
+
+/// Курсоры синхронизации коллектора (последний message id, последний admin log id).
+model SyncState {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+}
