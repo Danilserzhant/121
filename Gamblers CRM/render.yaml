@@ -1,0 +1,16 @@
+# Бесплатный дашборд на Render: засыпает после 15 минут простоя, просыпается за ~минуту.
+services:
+  - type: web
+    name: gamblers-crm
+    runtime: node
+    plan: free
+    rootDir: "Gamblers CRM"
+    buildCommand: npm ci && npm run build
+    startCommand: npx prisma db push --skip-generate && npm start
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: REPORT_TZ
+        value: Europe/Kyiv
+      - key: DATABASE_URL
+        sync: false

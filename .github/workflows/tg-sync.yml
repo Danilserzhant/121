@@ -1,0 +1,53 @@
+# Коллектор без сервера: GitHub Actions будит выгрузку из Telegram по расписанию.
+# Секреты: DATABASE_URL, TG_API_ID, TG_API_HASH, TG_SESSION. Переменные: TG_CHATS, REPORT_TZ.
+name: Telegram sync
+
+on:
+  schedule:
+    # Раз в час. Чаще — на свой страх: у бесплатной базы есть лимит часов работы.
+    - cron: "7 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "sync — только новое, backfill — вся история заново"
+        type: choice
+        options: [sync, backfill]
+        default: sync
+
+concurrency:
+  group: tg-sync
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: "Gamblers CRM"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: "Gamblers CRM/package-lock.json"
+
+      - run: npm ci
+
+      - name: Синхронизация схемы
+        run: npx prisma db push --skip-generate
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Выгрузка из Telegram
+        run: npm run tg:${{ inputs.mode || 'sync' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          TG_CHATS: ${{ vars.TG_CHATS }}
+          REPORT_TZ: ${{ vars.REPORT_TZ || 'Europe/Kyiv' }}
+          INACTIVE_DAYS: ${{ vars.INACTIVE_DAYS || '14' }}
