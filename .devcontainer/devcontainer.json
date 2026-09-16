@@ -1,0 +1,10 @@
+{
+  "name": "Gamblers CRM",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:22",
+  "postCreateCommand": "cd 'Gamblers CRM' && cp -n .env.example .env || true && npm install",
+  "customizations": {
+    "vscode": {
+      "extensions": ["Prisma.prisma"]
+    }
+  }
+}
