@@ -30,7 +30,7 @@ export default async function MemberPage({
   const person = await db.person.findUnique({
     where: { id: personId },
     include: {
-      memberships: { include: { chat: true, source: true }, orderBy: { joinedAt: "asc" } },
+      memberships: { include: { chat: true, source: true, inviteLink: true }, orderBy: { joinedAt: "asc" } },
       events: { include: { chat: true }, orderBy: { at: "desc" }, take: 20 },
     },
   });
@@ -93,7 +93,7 @@ export default async function MemberPage({
                 <dt style={{ color: "var(--text-muted)" }}>Источник</dt>
                 <dd>{membership.source?.title ?? "Без метки"}</dd>
                 <dt style={{ color: "var(--text-muted)" }}>Пригласительная ссылка</dt>
-                <dd className="truncate">{membership.inviteLinkId ? `#${membership.inviteLinkId}` : "—"}</dd>
+                <dd className="truncate">{membership.inviteLink?.title ?? membership.inviteLink?.link ?? "—"}</dd>
                 <dt style={{ color: "var(--text-muted)" }}>Заходов в группу</dt>
                 <dd>{membership.joinCount}</dd>
                 <dt style={{ color: "var(--text-muted)" }}>Premium</dt>
