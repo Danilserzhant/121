@@ -12,6 +12,7 @@
     "db:studio": "prisma studio",
     "db:seed": "tsx prisma/seed.ts",
     "tg:login": "tsx src/collector/login.ts",
+    "tg:chats": "tsx src/collector/chats.ts",
     "tg:backfill": "tsx src/collector/backfill.ts",
     "tg:sync": "tsx src/collector/sync.ts"
   },

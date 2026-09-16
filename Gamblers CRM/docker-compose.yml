@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задайте POSTGRES_PASSWORD в .env}
+      POSTGRES_DB: gamblers_crm
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d gamblers_crm"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  web:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/gamblers_crm?schema=public
+    # Схема накатывается при старте: первый запуск создаёт таблицы, дальше — no-op.
+    command: sh -c "npx prisma db push --skip-generate && npm start"
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  collector:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/gamblers_crm?schema=public
+    # .env примонтирован с хоста: tg:login пишет в него строку сессии, и она переживает пересборку.
+    volumes:
+      - ./.env:/app/.env
+    command: sh -c "while true; do npm run tg:sync || echo 'синхронизация не удалась, повторим позже'; sleep ${SYNC_INTERVAL:-600}; done"
+    depends_on:
+      web:
+        condition: service_started
+
+volumes:
+  pgdata:

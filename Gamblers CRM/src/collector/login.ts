@@ -29,7 +29,8 @@ async function main() {
     ? current.replace(/TG_SESSION=.*/g, `TG_SESSION="${session}"`)
     : `${current.trimEnd()}\nTG_SESSION="${session}"\n`;
   writeFileSync(envPath, next);
-  console.log("Строка сессии записана в .env (TG_SESSION). Никому её не передавайте.");
+  console.log("Строка сессии записана в .env (TG_SESSION). Это доступ к аккаунту — никому её не передавайте.");
+  console.log("Дальше: npm run tg:chats — покажет id групп для TG_CHATS, затем npm run tg:backfill.");
 
   await client.disconnect();
   rl.close();
