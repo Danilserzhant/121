@@ -2,6 +2,17 @@ import "dotenv/config";
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 
+// GramJS держит фоновую петлю обновлений и после отключения роняет процесс
+// ошибкой TIMEOUT — например, пока скрипт ждёт ответа на вопрос в терминале.
+// Эти ошибки к нашей работе отношения не имеют.
+const BACKGROUND_NOISE = ["TIMEOUT", "Not connected", "Connection closed"];
+process.on("unhandledRejection", (reason) => {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  if (BACKGROUND_NOISE.some((m) => message.includes(m))) return;
+  console.error("\nНе получилось: " + message);
+  process.exit(1);
+});
+
 export function requireEnv(name: string) {
   const v = process.env[name];
   if (!v) throw new Error(`Не задан ${name} в .env`);

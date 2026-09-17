@@ -43,6 +43,16 @@ async function main() {
 
   /* 2. Чаты */
   step(2, "Какие чаты отслеживаем");
+  if (process.env.TG_CHATS) {
+    const keep = (await ask(`Сейчас в .env: ${process.env.TG_CHATS}\nОставить? [Enter — да, n — выбрать заново]: `)).trim();
+    if (keep.toLowerCase() !== "n") {
+      console.log("Оставляю как есть.");
+      await stopClient(client);
+      await databaseStep();
+      await backfillStep();
+      return;
+    }
+  }
   const chats: { ref: string; title: string; kind: string; members: string; admin: string }[] = [];
   for (const dialog of await client.getDialogs({ limit: 200 })) {
     const e = dialog.entity;
@@ -91,9 +101,23 @@ async function main() {
         "\nатрибуция по пригласительным ссылкам читается из журнала администратора.",
     );
   }
-  await client.disconnect();
+  // Клиент гасим до вопросов про базу: иначе его фоновая петля падает по таймауту,
+  // пока пользователь ходит за строкой подключения.
+  await stopClient(client);
+  await databaseStep();
+  await backfillStep();
+}
 
-  /* 3. База */
+/** Останавливает клиент вместе с фоновыми петлями. */
+async function stopClient(client: { destroy: () => Promise<void> }) {
+  try {
+    await client.destroy();
+  } catch {
+    // уже отключён — не важно
+  }
+}
+
+async function databaseStep() {
   step(3, "База данных");
   if (!process.env.DATABASE_URL) {
     console.log("Нужна строка подключения к PostgreSQL.");
@@ -107,8 +131,9 @@ async function main() {
 
   console.log("Создаю таблицы…");
   execSync("npx prisma db push --skip-generate", { stdio: "inherit", env: process.env });
+}
 
-  /* 4. Выгрузка */
+async function backfillStep() {
   step(4, "Первая выгрузка");
   console.log("Тянем историю: участников, сообщения, вступления и выходы.");
   console.log("На большом чате это надолго — прерывать не нужно, повторный запуск продолжит с места остановки.\n");
