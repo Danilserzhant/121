@@ -1,5 +1,7 @@
 import "dotenv/config";
 import { Api, TelegramClient } from "telegram";
+import { Logger } from "telegram/extensions";
+import { LogLevel } from "telegram/extensions/Logger";
 import { StringSession } from "telegram/sessions";
 
 // GramJS держит фоновую петлю обновлений и после отключения роняет процесс
@@ -26,6 +28,9 @@ export async function createClient(session = process.env.TG_SESSION ?? "") {
     connectionRetries: 5,
     // GramJS сам ждёт при FLOOD_WAIT короче порога — иначе Telegram банит на часы.
     floodSleepThreshold: 120,
+    // По умолчанию GramJS сыплет INFO-строками про соединение прямо поверх
+    // наших вопросов. Оставляем только ошибки; TG_LOG_LEVEL="info" вернёт всё.
+    baseLogger: new Logger((process.env.TG_LOG_LEVEL as LogLevel) || LogLevel.ERROR),
   });
   return client;
 }
